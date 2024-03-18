@@ -11,7 +11,7 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Type, Uni
 import proto  # type: ignore[import-untyped]
 from google.cloud.aiplatform_v1beta1.types.content import Part as GapicPart
 from google.cloud.aiplatform_v1beta1.types.tool import FunctionCall
-from google.cloud.aiplatform import telemetry
+from google.cloud.aiplatform.telemetry import tool_context_manager
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
@@ -102,10 +102,10 @@ def _parse_chat_history(history: List[BaseMessage]) -> _ChatHistory:
         if i == 0 and isinstance(message, SystemMessage):
             context = content
         elif isinstance(message, AIMessage):
-            vertex_message = ChatMessage(content=message.content, author="bot")
+            vertex_message = ChatMessage(content=content, author="bot")
             vertex_messages.append(vertex_message)
         elif isinstance(message, HumanMessage):
-            vertex_message = ChatMessage(content=message.content, author="user")
+            vertex_message = ChatMessage(content=content, author="user")
             vertex_messages.append(vertex_message)
         else:
             raise ValueError(
@@ -216,7 +216,7 @@ def _parse_examples(examples: List[BaseMessage]) -> List[InputOutputTextPair]:
             f"Expect examples to have an even amount of messages, got {len(examples)}."
         )
     example_pairs = []
-    input_text = None
+    input_text = ""
     for i, example in enumerate(examples):
         if i % 2 == 0:
             if not isinstance(example, HumanMessage):
@@ -224,7 +224,7 @@ def _parse_examples(examples: List[BaseMessage]) -> List[InputOutputTextPair]:
                     f"Expected the first message in a part to be from human, got "
                     f"{type(example)} for the {i}th message."
                 )
-            input_text = example.content
+            input_text = str(example.content)
         if i % 2 == 1:
             if not isinstance(example, AIMessage):
                 raise ValueError(
@@ -232,7 +232,7 @@ def _parse_examples(examples: List[BaseMessage]) -> List[InputOutputTextPair]:
                     f"{type(example)} for the {i}th message."
                 )
             pair = InputOutputTextPair(
-                input_text=input_text, output_text=example.content
+                input_text=input_text, output_text=str(example.content)
             )
             example_pairs.append(pair)
     return example_pairs
@@ -255,19 +255,22 @@ def _parse_response_candidate(response_candidate: "Candidate") -> AIMessage:
         content = response_candidate.text
     except AttributeError:
         content = ""
+    except ValueError:
+        content = "[[ No response found from server. ]]"
 
     additional_kwargs = {}
-    first_part = response_candidate.content.parts[0]
-    if first_part.function_call:
-        function_call = {"name": first_part.function_call.name}
-        # dump to match other function calling llm for now
-        function_call_args_dict = proto.Message.to_dict(first_part.function_call)[
-            "args"
-        ]
-        function_call["arguments"] = json.dumps(
-            {k: function_call_args_dict[k] for k in function_call_args_dict}
-        )
-        additional_kwargs["function_call"] = function_call
+    if response_candidate.content.parts:
+        first_part = response_candidate.content.parts[0]
+        if first_part.function_call:
+            function_call = {"name": first_part.function_call.name}
+            # dump to match other function calling llm for now
+            function_call_args_dict = proto.Message.to_dict(first_part.function_call)[ # type: ignore
+                "args"
+            ]
+            function_call["arguments"] = json.dumps(
+                {k: function_call_args_dict[k] for k in function_call_args_dict}
+            )
+            additional_kwargs["function_call"] = function_call
     return AIMessage(content=content, additional_kwargs=additional_kwargs)
 
 
@@ -284,7 +287,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     raise an error."""
 
     @classmethod
-    def is_lc_serializable(self) -> bool:
+    def is_lc_serializable(cls) -> bool:
         return True
 
     @classmethod
@@ -348,7 +351,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         should_stream = stream if stream is not None else self.streaming
         safety_settings = kwargs.pop("safety_settings", None)
         if should_stream:
-            with telemetry.tool_context_manager(self._user_agent):
+            with tool_context_manager(self._user_agent):
                 stream_iter = self._stream(
                     messages, stop=stop, run_manager=run_manager, **kwargs
                 )
@@ -366,13 +369,13 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 convert_system_message_to_human=self.convert_system_message_to_human,
             )
             message = history_gemini.pop()
-            with telemetry.tool_context_manager(self._user_agent):
-                chat = self.client.start_chat(history=history_gemini)
+            with tool_context_manager(self._user_agent):
+                chat = self.client.start_chat(history=history_gemini, response_validation=False)
 
             # set param to `functions` until core tool/function calling implemented
             raw_tools = params.pop("functions") if "functions" in params else None
             tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
-            with telemetry.tool_context_manager(self._user_agent):
+            with tool_context_manager(self._user_agent):
                 response = chat.send_message(
                     message,
                     generation_config=params,
@@ -396,9 +399,10 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             examples = kwargs.get("examples") or self.examples
             if examples:
                 params["examples"] = _parse_examples(examples)
-            with telemetry.tool_context_manager(self._user_agent):
+            with tool_context_manager(self._user_agent):
                 chat = self._start_chat(history, **params)
-                response = chat.send_message(question.content, **msg_params)
+                response = chat.send_message(str(question.content), **msg_params)
+                print(json.dumps(response, indent=4, ensure_ascii=False)) # DEBUG
             generations = [
                 ChatGeneration(
                     message=AIMessage(content=candidate.text),
@@ -450,12 +454,12 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 convert_system_message_to_human=self.convert_system_message_to_human,
             )
             message = history_gemini.pop()
-            with telemetry.tool_context_manager(self._user_agent):
-                chat = self.client.start_chat(history=history_gemini)
+            with tool_context_manager(self._user_agent):
+                chat = self.client.start_chat(history=history_gemini, response_validation=False)
             # set param to `functions` until core tool/function calling implemented
             raw_tools = params.pop("functions") if "functions" in params else None
             tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
-            with telemetry.tool_context_manager(self._user_agent):
+            with tool_context_manager(self._user_agent):
                 response = await chat.send_message_async(
                     message,
                     generation_config=params,
@@ -479,9 +483,10 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             examples = kwargs.get("examples", None) or self.examples
             if examples:
                 params["examples"] = _parse_examples(examples)
-            with telemetry.tool_context_manager(self._user_agent):
-                chat = self._start_chat(history, **params)
-                response = await chat.send_message_async(question.content, **msg_params)
+            with tool_context_manager(self._user_agent):
+                chat = self._start_chat(history, **params, response_validation=False)
+                response = await chat.send_message_async(str(question.content), **msg_params)
+                print(json.dumps(response, indent=4, ensure_ascii=False)) # DEBUG
             generations = [
                 ChatGeneration(
                     message=AIMessage(content=r.text),
@@ -510,13 +515,13 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 convert_system_message_to_human=self.convert_system_message_to_human,
             )
             message = history_gemini.pop()
-            with telemetry.tool_context_manager(self._user_agent):
-                chat = self.client.start_chat(history=history_gemini)
+            with tool_context_manager(self._user_agent):
+                chat = self.client.start_chat(history=history_gemini, response_validation=False)
             # set param to `functions` until core tool/function calling implemented
             raw_tools = params.pop("functions") if "functions" in params else None
             tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
             safety_settings = params.pop("safety_settings", None)
-            with telemetry.tool_context_manager(self._user_agent):
+            with tool_context_manager(self._user_agent):
                 responses = chat.send_message(
                     message,
                     stream=True,
@@ -525,9 +530,10 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                     tools=tools,
                 )
                 for response in responses:
+                    print(response) # DEBUG
                     message = _parse_response_candidate(response.candidates[0])
                     if run_manager:
-                        run_manager.on_llm_new_token(message.content)
+                        run_manager.on_llm_new_token(str(message.content))
                     yield ChatGenerationChunk(
                         message=AIMessageChunk(
                             content=message.content,
@@ -545,9 +551,9 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             examples = kwargs.get("examples", None)
             if examples:
                 params["examples"] = _parse_examples(examples)
-            with telemetry.tool_context_manager(self._user_agent):
+            with tool_context_manager(self._user_agent):
                 chat = self._start_chat(history, **params)
-                responses = chat.send_message_streaming(question.content, **params)
+                responses = chat.send_message_streaming(str(question.content), **params)
                 for response in responses:
                     if run_manager:
                         run_manager.on_llm_new_token(response.text)
@@ -576,12 +582,12 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             convert_system_message_to_human=self.convert_system_message_to_human,
         )
         message = history_gemini.pop()
-        with telemetry.tool_context_manager(self._user_agent):
-            chat = self.client.start_chat(history=history_gemini)
+        with tool_context_manager(self._user_agent):
+            chat = self.client.start_chat(history=history_gemini, response_validation=False)
         raw_tools = params.pop("functions") if "functions" in params else None
         tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
         safety_settings = params.pop("safety_settings", None)
-        with telemetry.tool_context_manager(self._user_agent):
+        with tool_context_manager(self._user_agent):
             async for chunk in await chat.send_message_async(
                 message,
                 stream=True,
@@ -589,9 +595,10 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 safety_settings=safety_settings,
                 tools=tools,
             ):
+                print(chunk) # DEBUG
                 message = _parse_response_candidate(chunk.candidates[0])
                 if run_manager:
-                    await run_manager.on_llm_new_token(message.content)
+                    await run_manager.on_llm_new_token(str(message.content))
                 yield ChatGenerationChunk(
                     message=AIMessageChunk(
                         content=message.content,
