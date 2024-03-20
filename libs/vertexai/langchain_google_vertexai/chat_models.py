@@ -349,14 +349,13 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             ValueError: if the last message in the list is not from human.
         """
         should_stream = stream if stream is not None else self.streaming
-        safety_settings = kwargs.pop("safety_settings", None)
         if should_stream:
             with tool_context_manager(self._user_agent):
                 stream_iter = self._stream(
                     messages, stop=stop, run_manager=run_manager, **kwargs
                 )
                 return generate_from_stream(stream_iter)
-
+        safety_settings = kwargs.pop("safety_settings", None)
         params = self._prepare_params(stop=stop, stream=False, **kwargs)
         msg_params = {}
         if "candidate_count" in params:
