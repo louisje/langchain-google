@@ -122,6 +122,10 @@ Supported examples:
     )
     """Model name to use."""
     google_api_key: Optional[SecretStr] = None
+    credentials: Any = None
+    "The default custom credentials (google.auth.credentials.Credentials) to use "
+    "when making API calls. If not provided, credentials will be ascertained from "
+    "the GOOGLE_API_KEY envvar"
     temperature: float = 0.7
     """Run inference with this temperature. Must by in the closed interval
        [0.0, 1.0]."""
@@ -149,6 +153,12 @@ Supported examples:
     transport: Optional[str] = Field(
         None,
         description="A string, one of: [`rest`, `grpc`, `grpc_asyncio`].",
+    )
+    additional_headers: Optional[Dict[str, str]] = Field(
+        None,
+        description=(
+            "A key-value dictionary representing additional headers for the model call"
+        ),
     )
 
     safety_settings: Optional[Dict[HarmCategory, HarmBlockThreshold]] = None
@@ -203,21 +213,27 @@ class GoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseLLM):
     @root_validator()
     def validate_environment(cls, values: Dict) -> Dict:
         """Validates params and passes them to google-generativeai package."""
-        google_api_key = get_from_dict_or_env(
-            values, "google_api_key", "GOOGLE_API_KEY"
-        )
+        if values.get("credentials"):
+            genai.configure(
+                credentials=values.get("credentials"),
+                transport=values.get("transport"),
+                client_options=values.get("client_options"),
+            )
+        else:
+            google_api_key = get_from_dict_or_env(
+                values, "google_api_key", "GOOGLE_API_KEY"
+            )
+            if isinstance(google_api_key, SecretStr):
+                google_api_key = google_api_key.get_secret_value()
+            genai.configure(
+                api_key=google_api_key,
+                transport=values.get("transport"),
+                client_options=values.get("client_options"),
+            )
+
         model_name = values["model"]
 
         safety_settings = values["safety_settings"]
-
-        if isinstance(google_api_key, SecretStr):
-            google_api_key = google_api_key.get_secret_value()
-
-        genai.configure(
-            api_key=google_api_key,
-            transport=values.get("transport"),
-            client_options=values.get("client_options"),
-        )
 
         if safety_settings and (
             not GoogleModelFamily(model_name) == GoogleModelFamily.GEMINI

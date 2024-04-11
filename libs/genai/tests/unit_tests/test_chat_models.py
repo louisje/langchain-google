@@ -1,6 +1,7 @@
 """Test chat model integration."""
 
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
+from unittest.mock import Mock, patch
 
 import pytest
 from langchain_core.messages import (
@@ -60,16 +61,50 @@ def test_parse_history() -> None:
     message2 = AIMessage(content=text_answer1)
     message3 = HumanMessage(content=text_question2)
     messages = [system_message, message1, message2, message3]
-    history = _parse_chat_history(messages, convert_system_message_to_human=True)
+    system_instruction, history = _parse_chat_history(
+        messages, convert_system_message_to_human=True
+    )
     assert len(history) == 3
     assert history[0] == {
         "role": "user",
-        "parts": [{"text": system_input}, {"text": text_question1}],
+        "parts": [{"text": text_question1}],
     }
     assert history[1] == {"role": "model", "parts": [{"text": text_answer1}]}
+    assert system_instruction == [{"text": system_input}]
 
 
 @pytest.mark.parametrize("content", ['["a"]', '{"a":"b"}', "function output"])
 def test_parse_function_history(content: Union[str, List[Union[str, Dict]]]) -> None:
     function_message = FunctionMessage(name="search_tool", content=content)
     _parse_chat_history([function_message], convert_system_message_to_human=True)
+
+
+@pytest.mark.parametrize(
+    "headers", (None, {}, {"X-User-Header": "Coco", "X-User-Header2": "Jamboo"})
+)
+def test_additional_headers_support(headers: Optional[Dict[str, str]]) -> None:
+    mock_configure = Mock()
+    params = {
+        "google_api_key": "[secret]",
+        "client_options": {"api_endpoint": "http://127.0.0.1:8000/ai"},
+        "transport": "rest",
+        "additional_headers": headers,
+    }
+
+    with patch("langchain_google_genai.chat_models.genai.configure", mock_configure):
+        chat = ChatGoogleGenerativeAI(model="gemini-pro", **params)
+
+    expected_default_metadata: tuple = ()
+    if not headers:
+        assert chat.additional_headers == headers
+    else:
+        assert chat.additional_headers
+        assert all(header in chat.additional_headers for header in headers.keys())
+        expected_default_metadata = tuple(headers.items())
+
+    mock_configure.assert_called_once_with(
+        api_key=params["google_api_key"],
+        transport=params["transport"],
+        client_options=params["client_options"],
+        default_metadata=expected_default_metadata,
+    )

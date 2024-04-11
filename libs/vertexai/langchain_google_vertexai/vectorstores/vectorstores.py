@@ -1,6 +1,6 @@
 import uuid
 import warnings
-from typing import Any, Iterable, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, Union
 
 from google.cloud.aiplatform.matching_engine.matching_engine_index_endpoint import (
     Namespace,
@@ -10,14 +10,15 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 
-from langchain_google_vertexai.vectorstores._document_storage import (
-    DocumentStorage,
-    GCSDocumentStorage,
-)
 from langchain_google_vertexai.vectorstores._sdk_manager import VectorSearchSDKManager
 from langchain_google_vertexai.vectorstores._searcher import (
     Searcher,
     VectorSearchSearcher,
+)
+from langchain_google_vertexai.vectorstores.document_storage import (
+    DataStoreDocumentStorage,
+    DocumentStorage,
+    GCSDocumentStorage,
 )
 
 
@@ -114,19 +115,19 @@ class _BaseVertexAIVectorStore(VectorStore):
             embeddings=[embedding], k=k, filter_=filter, numeric_filter=numeric_filter
         )
 
-        results = []
+        keys = [key for key, _ in neighbors_list[0]]
+        distances = [distance for _, distance in neighbors_list[0]]
+        documents = self._document_storage.mget(keys)
 
-        for neighbor_id, distance in neighbors_list[0]:
-            document = self._document_storage.get_by_id(neighbor_id)
-
-            if document is None:
-                raise ValueError(
-                    f"Document with id {neighbor_id} not found in document" "storage."
-                )
-
-            results.append((document, distance))
-
-        return results
+        if all(document is not None for document in documents):
+            # Ignore typing because mypy doesn't seem to be able to identify that
+            # in documents there is no possibility to have None values with the
+            # check above.
+            return list(zip(documents, distances))  # type: ignore
+        else:
+            missing_docs = [key for key, doc in zip(keys, documents) if doc is None]
+            message = f"Documents with ids: {missing_docs} not found in the storage"
+            raise ValueError(message)
 
     def similarity_search(
         self,
@@ -196,7 +197,7 @@ class _BaseVertexAIVectorStore(VectorStore):
             for text, metadata in zip(texts, metadatas)
         ]
 
-        self._document_storage.batch_store_by_id(ids=ids, documents=documents)
+        self._document_storage.mset(list(zip(ids, documents)))
 
         embeddings = self._embeddings.embed_documents(texts)
 
@@ -302,6 +303,93 @@ class VectorSearchVectorStore(_BaseVertexAIVectorStore):
 
         return cls(
             document_storage=GCSDocumentStorage(bucket=bucket),
+            searcher=VectorSearchSearcher(
+                endpoint=endpoint,
+                index=index,
+                staging_bucket=bucket,
+                stream_update=stream_update,
+            ),
+            embbedings=embedding,
+        )
+
+
+class VectorSearchVectorStoreGCS(VectorSearchVectorStore):
+    """Alias of `VectorSearchVectorStore` for consistency with the rest of vector
+    stores with different document storage backends.
+    """
+
+
+class VectorSearchVectorStoreDatastore(_BaseVertexAIVectorStore):
+    """VectorSearch with DatasTore document storage."""
+
+    @classmethod
+    def from_components(
+        cls: Type["VectorSearchVectorStoreDatastore"],
+        project_id: str,
+        region: str,
+        index_id: str,
+        endpoint_id: str,
+        index_staging_bucket_name: Optional[str] = None,
+        credentials_path: Optional[str] = None,
+        embedding: Optional[Embeddings] = None,
+        stream_update: bool = False,
+        datastore_client_kwargs: Optional[Dict[str, Any]] = None,
+        datastore_kind: str = "document_id",
+        datastore_text_property_name: str = "text",
+        datastore_metadata_property_name: str = "metadata",
+        **kwargs: Dict[str, Any],
+    ) -> "VectorSearchVectorStoreDatastore":
+        """Takes the object creation out of the constructor.
+
+        # Args:
+            project_id: The GCP project id.
+            region: The default location making the API calls. It must have
+                the same location as the GCS bucket and must be regional.
+            index_id: The id of the created index.
+            endpoint_id: The id of the created endpoint.
+            index_staging_bucket_name: (Optional) If the index is updated by batch,
+                bucket where the data will be staged before updating the index. Only
+                required when updating the index.
+            credentials_path: (Optional) The path of the Google credentials on
+            the local file system.
+            embedding: The :class:`Embeddings` that will be used for
+            embedding the texts.
+            stream_update: Whether to update with streaming or batching. VectorSearch
+                index must be compatible with stream/batch updates.
+            kwargs: Additional keyword arguments to pass to
+                VertexAIVectorSearch.__init__().
+        """
+
+        sdk_manager = VectorSearchSDKManager(
+            project_id=project_id, region=region, credentials_path=credentials_path
+        )
+
+        sdk_manager = VectorSearchSDKManager(
+            project_id=project_id, region=region, credentials_path=credentials_path
+        )
+
+        if index_staging_bucket_name is not None:
+            bucket = sdk_manager.get_gcs_bucket(bucket_name=index_staging_bucket_name)
+        else:
+            bucket = None
+
+        index = sdk_manager.get_index(index_id=index_id)
+        endpoint = sdk_manager.get_endpoint(endpoint_id=endpoint_id)
+
+        if datastore_client_kwargs is None:
+            datastore_client_kwargs = {}
+
+        datastore_client = sdk_manager.get_datastore_client(**datastore_client_kwargs)
+
+        document_storage = DataStoreDocumentStorage(
+            datastore_client=datastore_client,
+            kind=datastore_kind,
+            text_property_name=datastore_text_property_name,
+            metadata_property_name=datastore_metadata_property_name,
+        )
+
+        return cls(
+            document_storage=document_storage,
             searcher=VectorSearchSearcher(
                 endpoint=endpoint,
                 index=index,

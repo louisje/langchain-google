@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+import warnings
 from io import BytesIO
 from typing import (
     Any,
@@ -300,27 +301,16 @@ def _convert_to_parts(
 
 def _parse_chat_history(
     input_messages: Sequence[BaseMessage], convert_system_message_to_human: bool = False
-) -> List[genai.types.ContentDict]:
+) -> Tuple[Optional[genai.types.ContentDict], List[genai.types.ContentDict]]:
     messages: List[genai.types.MessageDict] = []
 
-    raw_system_message: Optional[SystemMessage] = None
+    if convert_system_message_to_human:
+        warnings.warn("Convert_system_message_to_human will be deprecated!")
+
+    system_instruction: Optional[genai.types.ContentDict] = None
     for i, message in enumerate(input_messages):
-        if (
-            i == 0
-            and isinstance(message, SystemMessage)
-            and not convert_system_message_to_human
-        ):
-            raise ValueError(
-                """SystemMessages are not yet supported!
-
-To automatically convert the leading SystemMessage to a HumanMessage,
-set  `convert_system_message_to_human` to True. Example:
-
-llm = ChatGoogleGenerativeAI(model="gemini-pro", convert_system_message_to_human=True)
-"""
-            )
-        elif i == 0 and isinstance(message, SystemMessage):
-            raw_system_message = message
+        if i == 0 and isinstance(message, SystemMessage):
+            system_instruction = _convert_to_parts(message.content)
             continue
         elif isinstance(message, AIMessage):
             role = "model"
@@ -365,16 +355,8 @@ llm = ChatGoogleGenerativeAI(model="gemini-pro", convert_system_message_to_human
                 f"Unexpected message with type {type(message)} at the position {i}."
             )
 
-        if raw_system_message:
-            if role == "model":
-                raise ValueError(
-                    "SystemMessage should be followed by a HumanMessage and "
-                    "not by AIMessage."
-                )
-            parts = _convert_to_parts(raw_system_message.content) + parts
-            raw_system_message = None
         messages.append({"role": role, "parts": parts})
-    return messages
+    return system_instruction, messages
 
 
 def _parse_response_candidate(
@@ -483,17 +465,29 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
     @root_validator()
     def validate_environment(cls, values: Dict) -> Dict:
         """Validates params and passes them to google-generativeai package."""
-        google_api_key = get_from_dict_or_env(
-            values, "google_api_key", "GOOGLE_API_KEY"
-        )
-        if isinstance(google_api_key, SecretStr):
-            google_api_key = google_api_key.get_secret_value()
+        additional_headers = values.get("additional_headers") or {}
+        default_metadata = tuple(additional_headers.items())
 
-        genai.configure(
-            api_key=google_api_key,
-            transport=values.get("transport"),
-            client_options=values.get("client_options"),
-        )
+        if values.get("credentials"):
+            genai.configure(
+                credentials=values.get("credentials"),
+                transport=values.get("transport"),
+                client_options=values.get("client_options"),
+                default_metadata=default_metadata,
+            )
+        else:
+            google_api_key = get_from_dict_or_env(
+                values, "google_api_key", "GOOGLE_API_KEY"
+            )
+            if isinstance(google_api_key, SecretStr):
+                google_api_key = google_api_key.get_secret_value()
+
+            genai.configure(
+                api_key=google_api_key,
+                transport=values.get("transport"),
+                client_options=values.get("client_options"),
+                default_metadata=default_metadata,
+            )
         if (
             values.get("temperature") is not None
             and not 0 <= values["temperature"] <= 1
@@ -647,11 +641,15 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
             )
 
         params = self._prepare_params(stop, **kwargs)
-        history = _parse_chat_history(
+        system_instruction, history = _parse_chat_history(
             messages,
             convert_system_message_to_human=self.convert_system_message_to_human,
         )
         message = history.pop()
+        if self.client._system_instruction != system_instruction:
+            self.client = genai.GenerativeModel(
+                model_name=self.model, system_instruction=system_instruction
+            )
         chat = client.start_chat(history=history)
         return params, chat, message
 

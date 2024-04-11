@@ -27,16 +27,19 @@ from google.cloud.aiplatform.matching_engine.matching_engine_index_endpoint impo
 from langchain_core.documents import Document
 
 from langchain_google_vertexai.embeddings import VertexAIEmbeddings
-from langchain_google_vertexai.vectorstores._document_storage import (
-    DataStoreDocumentStorage,
-    DocumentStorage,
-    GCSDocumentStorage,
-)
 from langchain_google_vertexai.vectorstores._sdk_manager import VectorSearchSDKManager
 from langchain_google_vertexai.vectorstores._searcher import (
     VectorSearchSearcher,
 )
-from langchain_google_vertexai.vectorstores.vectorstores import VectorSearchVectorStore
+from langchain_google_vertexai.vectorstores.document_storage import (
+    DataStoreDocumentStorage,
+    DocumentStorage,
+    GCSDocumentStorage,
+)
+from langchain_google_vertexai.vectorstores.vectorstores import (
+    VectorSearchVectorStore,
+    VectorSearchVectorStoreDatastore,
+)
 
 
 @pytest.fixture
@@ -77,6 +80,22 @@ def vector_store() -> VectorSearchVectorStore:
     return vector_store
 
 
+@pytest.fixture
+def datastore_vector_store() -> VectorSearchVectorStoreDatastore:
+    embeddings = VertexAIEmbeddings(model_name="textembedding-gecko-default")
+
+    vector_store = VectorSearchVectorStoreDatastore.from_components(
+        project_id=os.environ["PROJECT_ID"],
+        region=os.environ["REGION"],
+        index_id=os.environ["STREAM_INDEX_ID_DATASTORE"],
+        endpoint_id=os.environ["STREAM_ENDPOINT_ID_DATASTORE"],
+        embedding=embeddings,
+        stream_update=True,
+    )
+
+    return vector_store
+
+
 @pytest.mark.extended
 def test_vector_search_sdk_manager(sdk_manager: VectorSearchSDKManager):
     gcs_client = sdk_manager.get_gcs_client()
@@ -97,7 +116,6 @@ def test_vector_search_sdk_manager(sdk_manager: VectorSearchSDKManager):
     "storage_class", ["gcs_document_storage", "datastore_document_storage"]
 )
 def test_document_storage(
-    sdk_manager: VectorSearchSDKManager,
     storage_class: str,
     request: pytest.FixtureRequest,
 ):
@@ -113,18 +131,20 @@ def test_document_storage(
     ]
     ids = [str(uuid4()) for i in range(N)]
 
-    # Test individual retrieval
-    for id, document in zip(ids, documents):
-        document_storage.store_by_id(document_id=id, document=document)
-        retrieved = document_storage.get_by_id(document_id=id)
-        assert document == retrieved
-
-    # Test batch regtrieval
-    document_storage.batch_store_by_id(ids, documents)
-    retrieved_documents = document_storage.batch_get_by_id(ids)
+    # Test batch storage and retrieval
+    document_storage.mset(list(zip(ids, documents)))
+    retrieved_documents = document_storage.mget(ids)
 
     for og_document, retrieved_document in zip(documents, retrieved_documents):
         assert og_document == retrieved_document
+
+    # Test key yielding
+    keys = list(document_storage.yield_keys())
+    assert all(id in keys for id in ids)
+
+    # Test deletion
+    document_storage.mdelete(ids)
+    assert all(item is None for item in document_storage.mget(ids))
 
 
 @pytest.mark.extended
@@ -145,8 +165,11 @@ def test_public_endpoint_vector_searcher(sdk_manager: VectorSearchSDKManager):
 
 
 @pytest.mark.extended
-def test_vector_store(vector_store: VectorSearchVectorStore):
-    assert isinstance(vector_store, VectorSearchVectorStore)
+@pytest.mark.parametrize(
+    "vector_store_class", ["vector_store", "datastore_vector_store"]
+)
+def test_vector_store(vector_store_class: str, request: pytest.FixtureRequest):
+    vector_store: VectorSearchVectorStore = request.getfixturevalue(vector_store_class)
 
     query = "What are your favourite animals?"
     docs_with_scores = vector_store.similarity_search_with_score(query, k=1)
@@ -162,7 +185,17 @@ def test_vector_store(vector_store: VectorSearchVectorStore):
 
 
 @pytest.mark.extended
-def test_vector_store_filtering(vector_store: VectorSearchVectorStore):
+@pytest.mark.parametrize(
+    "vector_store_class",
+    [
+        "vector_store",
+        # "datastore_vector_store" Waiting for the bug to be fixed as its stream
+    ],
+)
+def test_vector_store_filtering(
+    vector_store_class: str, request: pytest.FixtureRequest
+):
+    vector_store: VectorSearchVectorStore = request.getfixturevalue(vector_store_class)
     documents = vector_store.similarity_search(
         "I want some pants",
         filter=[Namespace(name="color", allow_tokens=["blue"])],
@@ -175,19 +208,20 @@ def test_vector_store_filtering(vector_store: VectorSearchVectorStore):
 
 
 @pytest.mark.extended
-def test_vector_store_update_index(sample_documents: List[Document]):
-    embeddings = VertexAIEmbeddings(model_name="textembedding-gecko-default")
-
-    vector_store = VectorSearchVectorStore.from_components(
-        project_id=os.environ["PROJECT_ID"],
-        region=os.environ["REGION"],
-        gcs_bucket_name=os.environ["GCS_BUCKET_NAME"],
-        index_id=os.environ["INDEX_ID"],
-        endpoint_id=os.environ["ENDPOINT_ID"],
-        embedding=embeddings,
-    )
-
+def test_vector_store_update_index(
+    vector_store: VectorSearchVectorStore, sample_documents: List[Document]
+):
     vector_store.add_documents(documents=sample_documents, is_complete_overwrite=True)
+
+
+@pytest.mark.extended
+def test_vector_store_stream_update_index(
+    datastore_vector_store: VectorSearchVectorStoreDatastore,
+    sample_documents: List[Document],
+):
+    datastore_vector_store.add_documents(
+        documents=sample_documents, is_complete_overwrite=True
+    )
 
 
 @pytest.fixture
