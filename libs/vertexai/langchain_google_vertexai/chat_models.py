@@ -6,7 +6,20 @@ import json
 import logging
 from dataclasses import dataclass, field
 from operator import itemgetter
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Type, Union, cast
+import uuid
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Type,
+    Union,
+    cast,
+)
 
 import proto  # type: ignore[import-untyped]
 from google.cloud.aiplatform_v1beta1.types.content import Part as GapicPart
@@ -31,6 +44,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.tools import BaseTool, tool as tool_from_callable
 from langchain_core.output_parsers.base import OutputParserLike
 from langchain_core.output_parsers.openai_functions import (
     JsonOutputFunctionsParser,
@@ -70,6 +84,7 @@ from langchain_google_vertexai._utils import (
     is_gemini_model,
 )
 from langchain_google_vertexai.functions_utils import (
+    _format_tool_config,
     _format_tools_to_vertex_tool,
 )
 
@@ -146,17 +161,22 @@ def _parse_chat_history_gemini(
     convert_system_message_to_human_content = None
     system_instruction = None
     for i, message in enumerate(history):
-        if (
-            i == 0
-            and isinstance(message, SystemMessage)
-            and not convert_system_message_to_human
-        ):
+        if isinstance(message, SystemMessage):
             if system_instruction is not None:
                 raise ValueError(
                     "Detected more than one SystemMessage in the list of messages."
-                    "Gemini APIs support the insertion of only SystemMessage."
+                    "Gemini APIs support the insertion of only one SystemMessage."
                 )
             else:
+                if convert_system_message_to_human:
+                    logger.warning(
+                        "gemini models released from April 2024 support"
+                        "SystemMessages natively. For best performances,"
+                        "when working with these models,"
+                        "set convert_system_message_to_human to False"
+                    )
+                    convert_system_message_to_human_content = message
+                    continue
                 system_instruction = Content(
                     role="user", parts=_convert_to_parts(message)
                 )
@@ -166,11 +186,6 @@ def _parse_chat_history_gemini(
             and isinstance(message, SystemMessage)
             and convert_system_message_to_human
         ):
-            logger.warning(
-                "gemini models released from April 2024 support SystemMessages"
-                "natively. For best performances, when working with these models,"
-                "set convert_system_message_to_human to False"
-            )
             convert_system_message_to_human_content = message
             continue
         elif isinstance(message, AIMessage):
@@ -202,9 +217,17 @@ def _parse_chat_history_gemini(
             ]
         elif isinstance(message, ToolMessage):
             role = "function"
+            if (i > 0) and isinstance(history[i - 1], AIMessage):
+                # message.name can be null for ToolMessage
+                if history[i - 1].tool_calls:  # type: ignore
+                    name = history[i - 1].tool_calls[0]["name"]  # type: ignore
+                else:
+                    name = message.name
+            else:
+                name = message.name
             parts = [
                 Part.from_function_response(
-                    name=message.name,
+                    name=name,
                     response={
                         "content": message.content,
                     },
@@ -273,13 +296,12 @@ def _get_client_with_sys_instruction(
     client: GenerativeModel,
     system_instruction: Content,
     model_name: str,
-    safety_settings: Optional[Dict] = None,
 ):
-    client = GenerativeModel(
-        model_name=model_name,
-        safety_settings=safety_settings,
-        system_instruction=system_instruction,
-    )
+    if client._system_instruction != system_instruction:
+        client = GenerativeModel(
+            model_name=model_name,
+            system_instruction=system_instruction,
+        )
     return client
 
 
@@ -310,7 +332,7 @@ def _parse_response_candidate(
                 ToolCallChunk(
                     name=function_call.get("name"),
                     args=function_call.get("arguments"),
-                    id=function_call.get("id"),
+                    id=function_call.get("id", str(uuid.uuid4())),
                     index=function_call.get("index"),
                 )
             ]
@@ -331,7 +353,7 @@ def _parse_response_candidate(
                     ToolCall(
                         name=tool_call["name"],
                         args=tool_call["args"],
-                        id=tool_call.get("id"),
+                        id=tool_call.get("id", str(uuid.uuid4())),
                     )
                     for tool_call in tool_calls_dicts
                 ]
@@ -340,7 +362,7 @@ def _parse_response_candidate(
                     InvalidToolCall(
                         name=function_call.get("name"),
                         args=function_call.get("arguments"),
-                        id=function_call.get("id"),
+                        id=function_call.get("id", str(uuid.uuid4())),
                         error=str(e),
                     )
                 ]
@@ -446,24 +468,27 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 project=self.project,
                 convert_system_message_to_human=self.convert_system_message_to_human,
             )
-            message = history_gemini.pop()
             self.client = _get_client_with_sys_instruction(
                 client=self.client,
                 system_instruction=system_instruction,
                 model_name=self.model_name,
-                safety_settings=safety_settings,
             )
-            with tool_context_manager(self._user_agent):
-                chat = self.client.start_chat(history=history_gemini, response_validation=False)
 
             # set param to `functions` until core tool/function calling implemented
             raw_tools = params.pop("functions") if "functions" in params else None
             tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
+            raw_tool_config = (
+                params.pop("tool_config") if "tool_config" in params else None
+            )
+            tool_config = (
+                _format_tool_config(raw_tool_config) if raw_tool_config else None
+            )
             with tool_context_manager(self._user_agent):
-                response = chat.send_message(
-                    message,
+                response = self.client.generate_content(
+                    history_gemini,
                     generation_config=params,
                     tools=tools,
+                    tool_config=tool_config,
                     safety_settings=safety_settings,
                 )
             generations = [
@@ -537,24 +562,27 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 project=self.project,
                 convert_system_message_to_human=self.convert_system_message_to_human,
             )
-            message = history_gemini.pop()
 
             self.client = _get_client_with_sys_instruction(
                 client=self.client,
                 system_instruction=system_instruction,
                 model_name=self.model_name,
-                safety_settings=safety_settings,
             )
-            with tool_context_manager(self._user_agent):
-                chat = self.client.start_chat(history=history_gemini, response_validation=False)
             # set param to `functions` until core tool/function calling implemented
             raw_tools = params.pop("functions") if "functions" in params else None
             tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
+            raw_tool_config = (
+                params.pop("tool_config") if "tool_config" in params else None
+            )
+            tool_config = (
+                _format_tool_config(raw_tool_config) if raw_tool_config else None
+            )
             with tool_context_manager(self._user_agent):
-                response = await chat.send_message_async(
-                    message,
+                response = await self.client.generate_content_async(
+                    history_gemini,
                     generation_config=params,
                     tools=tools,
+                    tool_config=tool_config,
                     safety_settings=safety_settings,
                 )
             generations = [
@@ -606,25 +634,28 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 project=self.project,
                 convert_system_message_to_human=self.convert_system_message_to_human,
             )
-            message = history_gemini.pop()
             self.client = _get_client_with_sys_instruction(
                 client=self.client,
                 system_instruction=system_instruction,
                 model_name=self.model_name,
-                safety_settings=safety_settings,
             )
-            with tool_context_manager(self._user_agent):
-                chat = self.client.start_chat(history=history_gemini, response_validation=False)
             # set param to `functions` until core tool/function calling implemented
             raw_tools = params.pop("functions") if "functions" in params else None
             tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
+            raw_tool_config = (
+                params.pop("tool_config") if "tool_config" in params else None
+            )
+            tool_config = (
+                _format_tool_config(raw_tool_config) if raw_tool_config else None
+            )
             with tool_context_manager(self._user_agent):
-                responses = chat.send_message(
-                    message,
+                responses = self.client.generate_content(
+                    history_gemini,
                     stream=True,
                     generation_config=params,
-                    safety_settings=safety_settings,
                     tools=tools,
+                    tool_config=tool_config,
+                    safety_settings=safety_settings,
                 )
                 for response in responses:
                     message = _parse_response_candidate(
@@ -635,7 +666,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                         self._is_gemini_model,
                         usage_metadata=response.to_dict().get("usage_metadata"),
                     )
-                    if run_manager:
+                    if run_manager and isinstance(message.content, str):
                         run_manager.on_llm_new_token(message.content)
                     if isinstance(message, AIMessageChunk):
                         yield ChatGenerationChunk(
@@ -692,19 +723,19 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             client=self.client,
             system_instruction=system_instruction,
             model_name=self.model_name,
-            safety_settings=safety_settings,
         )
-        with tool_context_manager(self._user_agent):
-            chat = self.client.start_chat(history=history_gemini, response_validation=False)
         raw_tools = params.pop("functions") if "functions" in params else None
         tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
+        raw_tool_config = params.pop("tool_config") if "tool_config" in params else None
+        tool_config = _format_tool_config(raw_tool_config) if raw_tool_config else None
         with tool_context_manager(self._user_agent):
-            async for chunk in await chat.send_message_async(
-                message,
+            async for chunk in await self.client.generate_content_async(
+                history_gemini,
                 stream=True,
                 generation_config=params,
-                safety_settings=safety_settings,
                 tools=tools,
+                tool_config=tool_config,
+                safety_settings=safety_settings,
             ):
                 print(chunk) # DEBUG
                 message = _parse_response_candidate(chunk.candidates[0], streaming=True)
@@ -713,7 +744,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                     self._is_gemini_model,
                     usage_metadata=chunk.to_dict().get("usage_metadata"),
                 )
-                if run_manager:
+                if run_manager and isinstance(message.content, str):
                     await run_manager.on_llm_new_token(message.content)
                 if isinstance(message, AIMessageChunk):
                     yield ChatGenerationChunk(
@@ -842,6 +873,37 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             return {"raw": llm} | parser_with_fallback
         else:
             return llm | parser
+
+    def bind_tools(
+        self,
+        tools: Sequence[Union[Type[BaseModel], Callable, BaseTool]],
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, BaseMessage]:
+        """Bind tool-like objects to this chat model.
+
+        Assumes model is compatible with Vertex tool-calling API.
+
+        Args:
+            tools: A list of tool definitions to bind to this chat model.
+                Can be a pydantic model, callable, or BaseTool. Pydantic
+                models, callables, and BaseTools will be automatically converted to
+                their schema dictionary representation.
+            **kwargs: Any additional parameters to pass to the
+                :class:`~langchain.runnable.Runnable` constructor.
+        """
+        formatted_tools = []
+        for schema in tools:
+            if isinstance(schema, BaseTool) or (
+                isinstance(schema, type) and issubclass(schema, BaseModel)
+            ):
+                formatted_tools.append(schema)
+            elif callable(schema):
+                formatted_tools.append(tool_from_callable(schema))  # type: ignore
+            else:
+                raise ValueError(
+                    "Tool must be a BaseTool, Pydantic model, or callable."
+                )
+        return super().bind(functions=formatted_tools, **kwargs)
 
     def _start_chat(
         self, history: _ChatHistory, **kwargs: Any
