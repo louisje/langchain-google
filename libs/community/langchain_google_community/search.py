@@ -1,8 +1,13 @@
 """Util that calls Google Search."""
 from typing import Any, Dict, List, Optional
+from langchain_community.document_loaders.chromium import AsyncChromiumLoader
+from langchain_community.document_transformers.html2text import Html2TextTransformer
 
 from langchain_core.callbacks import CallbackManagerForToolRun
 from langchain_core.pydantic_v1 import BaseModel, Extra, root_validator
+from langchain_core.callbacks.manager import CallbackManagerForRetrieverRun
+from langchain_core.documents.base import Document
+from langchain_core.retrievers import BaseRetriever
 from langchain_core.tools import BaseTool
 from langchain_core.utils import get_from_dict_or_env
 
@@ -178,3 +183,38 @@ class GoogleSearchResults(BaseTool):
     ) -> str:
         """Use the tool."""
         return str(self.api_wrapper.results(query, self.num_results))
+
+class GoogleSearchRetriever(BaseRetriever):
+    """Tool that queries the Google Search API and gets back json."""
+
+    name: str = "google_search_retriever"
+    description: str = (
+        "A wrapper around Google Search. "
+        "Useful for when you need to answer questions about current events. "
+        "Input should be a search query. Output is a Document list of the query results"
+    )
+    num_results: int = 2
+    api_wrapper: GoogleSearchAPIWrapper
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun,
+    ) -> List[Document]:
+
+        print("SEARCH_QUERY: ", query) # DEBUG
+
+        search_results = self.api_wrapper.results(query, self.num_results)
+
+        print("SEARCH_RESULTS: ", search_results) # DEBUG
+
+        if len(search_results) == 1 and "Result" in search_results[0]:
+            return [Document(page_content="No search results found.")]
+
+        loader = AsyncChromiumLoader([result["link"] for result in search_results])
+        htmls = loader.load()
+        html2text = Html2TextTransformer()
+        docs = html2text.transform_documents(htmls)
+
+        return [doc for doc in docs]

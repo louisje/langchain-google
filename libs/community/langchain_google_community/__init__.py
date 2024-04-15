@@ -16,6 +16,7 @@ from langchain_google_community.search import (
     GoogleSearchAPIWrapper,
     GoogleSearchResults,
     GoogleSearchRun,
+    GoogleSearchRetriever,
 )
 from langchain_google_community.texttospeech import TextToSpeechTool
 from langchain_google_community.translate import GoogleTranslateTransformer

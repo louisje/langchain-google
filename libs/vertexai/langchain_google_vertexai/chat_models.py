@@ -59,6 +59,9 @@ from vertexai.generative_models import (  # type: ignore
     GenerativeModel,
     Part,
 )
+from vertexai.generative_models._generative_models import (  # type: ignore
+    ToolConfig,
+)
 from vertexai.language_models import (  # type: ignore
     ChatMessage,
     ChatModel,
@@ -85,6 +88,7 @@ from langchain_google_vertexai._utils import (
 )
 from langchain_google_vertexai.functions_utils import (
     _format_tool_config,
+    _format_tool_to_vertex_function,
     _format_tools_to_vertex_tool,
 )
 
@@ -157,7 +161,7 @@ def _parse_chat_history_gemini(
             raw_content = [raw_content]
         return [_convert_to_prompt(part) for part in raw_content]
 
-    vertex_messages = []
+    vertex_messages: List[Content] = []
     convert_system_message_to_human_content = None
     system_instruction = None
     for i, message in enumerate(history):
@@ -382,6 +386,10 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     model_name: str = "chat-bison"
     "Underlying model name."
     examples: Optional[List[BaseMessage]] = None
+    tuned_model_name: Optional[str] = None
+    """The name of a tuned model. If tuned_model_name is passed
+    model_name will be used to determine the model family
+    """
     convert_system_message_to_human: bool = False
     """[Deprecated] Since new Gemini models support setting a System Message,
     setting this parameter to True is discouraged.
@@ -401,17 +409,26 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         """Validate that the python package exists in environment."""
         is_gemini = is_gemini_model(values["model_name"])
         safety_settings = values["safety_settings"]
+        tuned_model_name = values.get("tuned_model_name")
 
         if safety_settings and not is_gemini:
             raise ValueError("Safety settings are only supported for Gemini models")
 
         cls._init_vertexai(values)
+
+        if tuned_model_name:
+            generative_model_name = values["tuned_model_name"]
+        else:
+            generative_model_name = values["model_name"]
+
         if is_gemini:
             values["client"] = GenerativeModel(
-                model_name=values["model_name"], safety_settings=safety_settings
+                model_name=generative_model_name,
+                safety_settings=safety_settings,
             )
             values["client_preview"] = GenerativeModel(
-                model_name=values["model_name"], safety_settings=safety_settings
+                model_name=generative_model_name,
+                safety_settings=safety_settings,
             )
         else:
             if is_codey_model(values["model_name"]):
@@ -420,11 +437,22 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             else:
                 model_cls = ChatModel
                 model_cls_preview = PreviewChatModel
-            values["client"] = model_cls.from_pretrained(values["model_name"])
+            values["client"] = model_cls.from_pretrained(generative_model_name)
             values["client_preview"] = model_cls_preview.from_pretrained(
-                values["model_name"]
+                generative_model_name
             )
         return values
+
+    @property
+    def _is_gemini_advanced(self) -> bool:
+        try:
+            if float(self.model_name.split("-")[1]) > 1.0:
+                return True
+        except ValueError:
+            pass
+        except IndexError:
+            pass
+        return False
 
     def _generate(
         self,
@@ -718,7 +746,6 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             project=self.project,
             convert_system_message_to_human=self.convert_system_message_to_human,
         )
-        message = history_gemini.pop()
         self.client = _get_client_with_sys_instruction(
             client=self.client,
             system_instruction=system_instruction,
@@ -862,7 +889,21 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             )
         else:
             parser = JsonOutputFunctionsParser()
-        llm = self.bind(functions=[schema])
+
+        name = _format_tool_to_vertex_function(schema)["name"]
+
+        if self._is_gemini_advanced:
+            llm = self.bind(
+                functions=[schema],
+                tool_config={
+                    "function_calling_config": {
+                        "mode": ToolConfig.FunctionCallingConfig.Mode.ANY,
+                        "allowed_function_names": [name],
+                    }
+                },
+            )
+        else:
+            llm = self.bind(functions=[schema])
         if include_raw:
             parser_with_fallback = RunnablePassthrough.assign(
                 parsed=itemgetter("raw") | parser, parsing_error=lambda _: None
@@ -877,6 +918,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     def bind_tools(
         self,
         tools: Sequence[Union[Type[BaseModel], Callable, BaseTool]],
+        tool_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, BaseMessage]:
         """Bind tool-like objects to this chat model.
@@ -903,7 +945,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 raise ValueError(
                     "Tool must be a BaseTool, Pydantic model, or callable."
                 )
-        return super().bind(functions=formatted_tools, **kwargs)
+        return self.bind(functions=formatted_tools, tool_config=tool_config, **kwargs)
 
     def _start_chat(
         self, history: _ChatHistory, **kwargs: Any
