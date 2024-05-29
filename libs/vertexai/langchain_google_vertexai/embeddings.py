@@ -44,7 +44,7 @@ class GoogleEmbeddingModelType(str, Enum):
 
     @classmethod
     def _missing_(cls, value: Any) -> Optional["GoogleEmbeddingModelType"]:
-        if "textembedding-gecko" in value.lower():
+        if value.lower().startswith("text"):
             return GoogleEmbeddingModelType.TEXT
         elif "multimodalembedding" in value.lower():
             return GoogleEmbeddingModelType.MULTIMODAL
@@ -78,7 +78,7 @@ class VertexAIEmbeddings(_VertexAICommon, Embeddings):
 
     def __init__(
         self,
-        model_name: str,
+        model_name: Optional[str] = None,
         project: Optional[str] = None,
         location: str = "us-central1",
         request_parallelism: int = 5,
@@ -87,13 +87,14 @@ class VertexAIEmbeddings(_VertexAICommon, Embeddings):
         **kwargs: Any,
     ):
         """Initialize the sentence_transformer."""
+        if model_name:
+            kwargs["model_name"] = model_name
         super().__init__(
             project=project,
             location=location,
             credentials=credentials,
             request_parallelism=request_parallelism,
             max_retries=max_retries,
-            model_name=model_name,
             **kwargs,
         )
         self.instance["max_batch_size"] = kwargs.get("max_batch_size", _MAX_BATCH_SIZE)

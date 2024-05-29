@@ -9,7 +9,7 @@ from langchain_core.callbacks.manager import (
 )
 from langchain_core.language_models.llms import BaseLLM
 from langchain_core.outputs import Generation, GenerationChunk, LLMResult
-from langchain_core.pydantic_v1 import root_validator
+from langchain_core.pydantic_v1 import Field, root_validator
 from vertexai.generative_models import (  # type: ignore[import-untyped]
     Candidate,
     GenerativeModel,
@@ -29,13 +29,10 @@ from vertexai.preview.language_models import (
     TextGenerationModel as PreviewTextGenerationModel,
 )
 
-from langchain_google_vertexai._base import (
-    _VertexAICommon,
-)
+from langchain_google_vertexai._base import GoogleModelFamily, _VertexAICommon
 from langchain_google_vertexai._utils import (
     create_retry_decorator,
     get_generation_info,
-    is_codey_model,
     is_gemini_model,
 )
 
@@ -110,12 +107,23 @@ async def _acompletion_with_retry(
 class VertexAI(_VertexAICommon, BaseLLM):
     """Google Vertex AI large language models."""
 
-    model_name: str = "text-bison"
+    model_name: str = Field(default="text-bison", alias="model")
     "The name of the Vertex AI large language model."
     tuned_model_name: Optional[str] = None
     """The name of a tuned model. If tuned_model_name is passed
     model_name will be used to determine the model family
     """
+
+    def __init__(self, *, model_name: Optional[str] = None, **kwargs: Any) -> None:
+        """Needed for mypy typing to recognize model_name as a valid arg."""
+        if model_name:
+            kwargs["model_name"] = model_name
+        super().__init__(**kwargs)
+
+    class Config:
+        """Configuration for this pydantic object."""
+
+        allow_population_by_field_name = True
 
     @classmethod
     def is_lc_serializable(self) -> bool:
@@ -130,15 +138,15 @@ class VertexAI(_VertexAICommon, BaseLLM):
     def validate_environment(cls, values: Dict) -> Dict:
         """Validate that the python package exists in environment."""
         tuned_model_name = values.get("tuned_model_name")
-        model_name = values["model_name"]
         safety_settings = values["safety_settings"]
-        is_gemini = is_gemini_model(values["model_name"])
+        values["model_family"] = GoogleModelFamily(values["model_name"])
+        is_gemini = is_gemini_model(values["model_family"])
         cls._init_vertexai(values)
 
         if safety_settings and (not is_gemini or tuned_model_name):
             raise ValueError("Safety settings are only supported for Gemini models")
 
-        if is_codey_model(model_name):
+        if values["model_family"] == GoogleModelFamily.CODEY:
             model_cls = CodeGenerationModel
             preview_model_cls = PreviewCodeGenerationModel
         elif is_gemini:

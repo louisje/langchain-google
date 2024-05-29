@@ -19,11 +19,12 @@ from typing import (
     Type,
     Union,
     cast,
+    Literal,
+    TypedDict,
+    overload,
 )
 
 import proto  # type: ignore[import-untyped]
-from google.cloud.aiplatform_v1beta1.types.content import Part as GapicPart
-from google.cloud.aiplatform_v1beta1.types.tool import FunctionCall
 from google.cloud.aiplatform.telemetry import tool_context_manager
 
 from langchain_core.callbacks import (
@@ -33,6 +34,7 @@ from langchain_core.callbacks import (
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.chat_models import (
     BaseChatModel,
+    LangSmithParams,
     generate_from_stream,
 )
 from langchain_core.messages import (
@@ -44,23 +46,22 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langchain_core.tools import BaseTool, tool as tool_from_callable
 from langchain_core.output_parsers.base import OutputParserLike
-from langchain_core.output_parsers.openai_functions import (
-    JsonOutputFunctionsParser,
-    PydanticOutputFunctionsParser,
+from langchain_core.output_parsers.openai_tools import (
+    JsonOutputToolsParser,
+    PydanticToolsParser,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.pydantic_v1 import BaseModel, root_validator
+from langchain_core.pydantic_v1 import BaseModel, root_validator, Field
 from langchain_core.runnables import Runnable, RunnablePassthrough
 from vertexai.generative_models import (  # type: ignore
-    Candidate,
-    Content,
-    GenerativeModel,
-    Part,
+    Tool as VertexTool,
 )
 from vertexai.generative_models._generative_models import (  # type: ignore
     ToolConfig,
+    SafetySettingsType,
+    GenerationConfigType,
+    GenerationResponse,
 )
 from vertexai.language_models import (  # type: ignore
     ChatMessage,
@@ -77,22 +78,53 @@ from vertexai.preview.language_models import (
     CodeChatModel as PreviewCodeChatModel,
 )
 
-from langchain_google_vertexai._base import (
-    _VertexAICommon,
+from google.cloud.aiplatform_v1beta1.types import (
+    Blob,
+    Candidate,
+    Part,
+    HarmCategory,
+    Content,
+    FileData,
+    FunctionCall,
+    FunctionResponse,
+    GenerateContentRequest,
+    GenerationConfig,
+    SafetySetting,
+    Tool as GapicTool,
+    ToolConfig as GapicToolConfig,
+    VideoMetadata,
 )
+from langchain_google_vertexai._base import _VertexAICommon, GoogleModelFamily
 from langchain_google_vertexai._image_utils import ImageBytesLoader
 from langchain_google_vertexai._utils import (
+    create_retry_decorator,
     get_generation_info,
-    is_codey_model,
-    is_gemini_model,
+    _format_model_name,
 )
 from langchain_google_vertexai.functions_utils import (
     _format_tool_config,
-    _format_tool_to_vertex_function,
-    _format_tools_to_vertex_tool,
+    _ToolConfigDict,
+    _tool_choice_to_tool_config,
+    _ToolChoiceType,
+    _ToolsType,
+    _format_to_gapic_tool,
 )
 
 logger = logging.getLogger(__name__)
+
+
+_allowed_params = [
+    "temperature",
+    "top_k",
+    "top_p",
+    "response_mime_type",
+    "temperature",
+    "max_output_tokens",
+    "presence_penalty",
+    "frequency_penalty",
+    "candidate_count",
+]
+_allowed_params_prediction_service = ["request", "timeout", "metadata"]
 
 
 @dataclass
@@ -101,6 +133,13 @@ class _ChatHistory:
 
     history: List[ChatMessage] = field(default_factory=list)
     context: Optional[str] = None
+
+
+class _GeminiGenerateContentKwargs(TypedDict):
+    generation_config: Optional[GenerationConfigType]
+    safety_settings: Optional[SafetySettingsType]
+    tools: Optional[List[VertexTool]]
+    tool_config: Optional[ToolConfig]
 
 
 def _parse_chat_history(history: List[BaseMessage]) -> _ChatHistory:
@@ -141,19 +180,43 @@ def _parse_chat_history_gemini(
 ) -> tuple[Content | None, list[Content]]:
     def _convert_to_prompt(part: Union[str, Dict]) -> Part:
         if isinstance(part, str):
-            return Part.from_text(part)
+            return Part(text=part)
 
         if not isinstance(part, Dict):
             raise ValueError(
                 f"Message's content is expected to be a dict, got {type(part)}!"
             )
         if part["type"] == "text":
-            return Part.from_text(part["text"])
+            return Part(text=part["text"])
         if part["type"] == "image_url":
             path = part["image_url"]["url"]
-            return ImageBytesLoader(project=project).load_part(path)
+            return ImageBytesLoader(project=project).load_gapic_part(path)
 
-        raise ValueError("Only text and image_url types are supported!")
+        # Handle media type like LangChain.js
+        # https://github.com/langchain-ai/langchainjs/blob/e536593e2585f1dd7b0afc187de4d07cb40689ba/libs/langchain-google-common/src/utils/gemini.ts#L93-L106
+        if part["type"] == "media":
+            if "mime_type" not in part:
+                raise ValueError(f"Missing mime_type in media part: {part}")
+            mime_type = part["mime_type"]
+            proto_part = Part()
+
+            if "data" in part:
+                proto_part.inline_data = Blob(data=part["data"], mime_type=mime_type)
+            elif "file_uri" in part:
+                proto_part.file_data = FileData(
+                    file_uri=part["file_uri"], mime_type=mime_type
+                )
+            else:
+                raise ValueError(
+                    f"Media part must have either data or file_uri: {part}"
+                )
+
+            if "video_metadata" in part:
+                metadata = VideoMetadata(part["video_metadata"])
+                proto_part.video_metadata = metadata
+            return proto_part
+
+        raise ValueError("Only text, image_url, and media types are supported!")
 
     def _convert_to_parts(message: BaseMessage) -> List[Part]:
         raw_content = message.content
@@ -162,97 +225,123 @@ def _parse_chat_history_gemini(
         return [_convert_to_prompt(part) for part in raw_content]
 
     vertex_messages: List[Content] = []
-    convert_system_message_to_human_content = None
+    system_parts: List[Part] | None = None
     system_instruction = None
+
     for i, message in enumerate(history):
         if isinstance(message, SystemMessage):
+            if i != 0:
+                raise ValueError("SystemMessage should be the first in the history.")
             if system_instruction is not None:
                 raise ValueError(
                     "Detected more than one SystemMessage in the list of messages."
                     "Gemini APIs support the insertion of only one SystemMessage."
                 )
-            else:
-                if convert_system_message_to_human:
-                    logger.warning(
-                        "gemini models released from April 2024 support"
-                        "SystemMessages natively. For best performances,"
-                        "when working with these models,"
-                        "set convert_system_message_to_human to False"
-                    )
-                    convert_system_message_to_human_content = message
-                    continue
-                system_instruction = Content(
-                    role="user", parts=_convert_to_parts(message)
+            if convert_system_message_to_human:
+                logger.warning(
+                    "gemini models released from April 2024 support"
+                    "SystemMessages natively. For best performances,"
+                    "when working with these models,"
+                    "set convert_system_message_to_human to False"
                 )
+                system_parts = _convert_to_parts(message)
                 continue
-        elif (
-            i == 0
-            and isinstance(message, SystemMessage)
-            and convert_system_message_to_human
-        ):
-            convert_system_message_to_human_content = message
-            continue
-        elif isinstance(message, AIMessage):
-            raw_function_call = message.additional_kwargs.get("function_call")
-            role = "model"
-            if raw_function_call:
-                function_call = FunctionCall(
-                    {
-                        "name": raw_function_call["name"],
-                        "args": json.loads(raw_function_call["arguments"]),
-                    }
-                )
-                gapic_part = GapicPart(function_call=function_call)
-                parts = [Part._from_gapic(gapic_part)]
-            else:
-                parts = _convert_to_parts(message)
+            system_instruction = Content(role="user", parts=_convert_to_parts(message))
         elif isinstance(message, HumanMessage):
             role = "user"
             parts = _convert_to_parts(message)
+            if system_parts is not None:
+                if i != 1:
+                    raise ValueError(
+                        "System message should be immediately followed by HumanMessage"
+                    )
+                parts = system_parts + parts
+                system_parts = None
+            vertex_messages.append(Content(role=role, parts=parts))
+        elif isinstance(message, AIMessage):
+            role = "model"
+
+            parts = []
+            if message.content:
+                parts = _convert_to_parts(message)
+
+            for tc in message.tool_calls:
+                function_call = FunctionCall(
+                    {
+                        "name": tc["name"],
+                        "args": tc["args"],
+                    }
+                )
+                parts.append(Part(function_call=function_call))
+
+            vertex_messages.append(Content(role=role, parts=parts))
         elif isinstance(message, FunctionMessage):
             role = "function"
-            parts = [
-                Part.from_function_response(
-                    name=message.name,
-                    response={
-                        "content": message.content,
-                    },
+
+            part = Part(
+                function_response=FunctionResponse(
+                    name=message.name, response={"content": message.content}
                 )
-            ]
+            )
+
+            prev_content = vertex_messages[-1]
+            prev_content_is_function = prev_content and prev_content.role == "function"
+            if prev_content_is_function:
+                parts = list(prev_content.parts)
+                parts.append(part)
+                # replacing last message
+                vertex_messages[-1] = Content(role=role, parts=parts)
+                continue
+
+            parts = [part]
+
+            vertex_messages.append(Content(role=role, parts=parts))
         elif isinstance(message, ToolMessage):
             role = "function"
-            if (i > 0) and isinstance(history[i - 1], AIMessage):
-                # message.name can be null for ToolMessage
-                if history[i - 1].tool_calls:  # type: ignore
-                    name = history[i - 1].tool_calls[0]["name"]  # type: ignore
-                else:
-                    name = message.name
-            else:
-                name = message.name
-            parts = [
-                Part.from_function_response(
+
+            # message.name can be null for ToolMessage
+            name = message.name
+            if name is None:
+                prev_message = history[i - 1] if i > 0 else None
+                if isinstance(prev_message, AIMessage):
+                    tool_call_id = message.tool_call_id
+                    tool_call: ToolCall | None = next(
+                        (t for t in prev_message.tool_calls if t["id"] == tool_call_id),
+                        None,
+                    )
+                    if tool_call is None:
+                        raise ValueError(
+                            (
+                                "Message name is empty and can't find"
+                                + f"corresponding tool call for id: '${tool_call_id}'"
+                            )
+                        )
+                    name = tool_call["name"]
+            part = Part(
+                function_response=FunctionResponse(
                     name=name,
                     response={
                         "content": message.content,
                     },
                 )
-            ]
+            )
+
+            prev_content = vertex_messages[-1]
+            prev_content_is_function = prev_content and prev_content.role == "function"
+            if prev_content_is_function:
+                parts = list(prev_content.parts)
+                parts.append(part)
+                # replacing last message
+                vertex_messages[-1] = Content(role=role, parts=parts)
+                continue
+
+            parts = [part]
+
+            vertex_messages.append(Content(role=role, parts=parts))
         else:
             raise ValueError(
                 f"Unexpected message with type {type(message)} at the position {i}."
             )
-
-        if convert_system_message_to_human_content:
-            if role == "model":
-                raise ValueError(
-                    "SystemMessage should be followed by a HumanMessage and "
-                    "not by AIMessage."
-                )
-            parts = _convert_to_parts(convert_system_message_to_human_content) + parts
-            convert_system_message_to_human_content = None
-
-        vertex_message = Content(role=role, parts=parts)
-        vertex_messages.append(vertex_message)
     return system_instruction, vertex_messages
 
 
@@ -296,17 +385,18 @@ def _get_question(messages: List[BaseMessage]) -> HumanMessage:
     return question
 
 
-def _get_client_with_sys_instruction(
-    client: GenerativeModel,
-    system_instruction: Content,
-    model_name: str,
-):
-    if client._system_instruction != system_instruction:
-        client = GenerativeModel(
-            model_name=model_name,
-            system_instruction=system_instruction,
-        )
-    return client
+@overload
+def _parse_response_candidate(
+    response_candidate: "Candidate", streaming: Literal[False] = False
+) -> AIMessage:
+    ...
+
+
+@overload
+def _parse_response_candidate(
+    response_candidate: "Candidate", streaming: Literal[True]
+) -> AIMessageChunk:
+    ...
 
 
 def _parse_response_candidate(
@@ -319,81 +409,178 @@ def _parse_response_candidate(
     except ValueError:
         content = "[[ No response found from server. ]]"
 
+    content: Union[None, str, List[str]] = None
     additional_kwargs = {}
-    first_part = response_candidate.content.parts[0]
-    if first_part.function_call:
-        function_call = {"name": first_part.function_call.name}
-        # dump to match other function calling llm for now
-        function_call_args_dict = proto.Message.to_dict(first_part.function_call)[
-            "args"
-        ]
-        function_call["arguments"] = json.dumps(
-            {k: function_call_args_dict[k] for k in function_call_args_dict}
-        )
-        additional_kwargs["function_call"] = function_call
-        if streaming:
-            tool_call_chunks = [
-                ToolCallChunk(
-                    name=function_call.get("name"),
-                    args=function_call.get("arguments"),
-                    id=function_call.get("id", str(uuid.uuid4())),
-                    index=function_call.get("index"),
-                )
-            ]
-            return AIMessageChunk(
-                content=content,
-                additional_kwargs=additional_kwargs,
-                tool_call_chunks=tool_call_chunks,
-            )
-        else:
-            tool_calls = []
-            invalid_tool_calls = []
-            try:
-                tool_calls_dicts = parse_tool_calls(
-                    [{"function": function_call}],
-                    return_id=False,
-                )
-                tool_calls = [
-                    ToolCall(
-                        name=tool_call["name"],
-                        args=tool_call["args"],
-                        id=tool_call.get("id", str(uuid.uuid4())),
+    tool_calls = []
+    invalid_tool_calls = []
+    tool_call_chunks = []
+
+    for part in response_candidate.content.parts:
+        try:
+            text: Optional[str] = part.text
+        except AttributeError:
+            text = None
+
+        if text:
+            if not content:
+                content = text
+            elif isinstance(content, str):
+                content = [content, text]
+            elif isinstance(content, list):
+                content.append(text)
+            else:
+                raise Exception("Unexpected content type")
+
+        if part.function_call:
+            if "function_call" in additional_kwargs:
+                logger.warning(
+                    (
+                        "This model can reply with multiple "
+                        "function calls in one response. "
+                        "Please don't rely on `additional_kwargs.function_call` "
+                        "as only the last one will be saved."
+                        "Use `tool_calls` instead."
                     )
-                    for tool_call in tool_calls_dicts
-                ]
-            except Exception as e:
-                invalid_tool_calls = [
-                    InvalidToolCall(
+                )
+            function_call = {"name": part.function_call.name}
+            # dump to match other function calling llm for now
+            function_call_args_dict = proto.Message.to_dict(part.function_call)["args"]
+            function_call["arguments"] = json.dumps(
+                {k: function_call_args_dict[k] for k in function_call_args_dict}
+            )
+            additional_kwargs["function_call"] = function_call
+
+            if streaming:
+                index = function_call.get("index")
+                tool_call_chunks.append(
+                    ToolCallChunk(
                         name=function_call.get("name"),
                         args=function_call.get("arguments"),
                         id=function_call.get("id", str(uuid.uuid4())),
-                        error=str(e),
+                        index=int(index) if index else None,
                     )
-                ]
+                )
+            else:
+                try:
+                    tool_calls_dicts = parse_tool_calls(
+                        [{"function": function_call}],
+                        return_id=False,
+                    )
+                    tool_calls.extend(
+                        [
+                            ToolCall(
+                                name=tool_call["name"],
+                                args=tool_call["args"],
+                                id=tool_call.get("id", str(uuid.uuid4())),
+                            )
+                            for tool_call in tool_calls_dicts
+                        ]
+                    )
+                except Exception as e:
+                    invalid_tool_calls.append(
+                        InvalidToolCall(
+                            name=function_call.get("name"),
+                            args=function_call.get("arguments"),
+                            id=function_call.get("id", str(uuid.uuid4())),
+                            error=str(e),
+                        )
+                    )
+    if content is None:
+        content = ""
 
-            return AIMessage(
-                content=content,
-                additional_kwargs=additional_kwargs,
-                tool_calls=tool_calls,
-                invalid_tool_calls=invalid_tool_calls,
-            )
-    return AIMessage(content=content, additional_kwargs=additional_kwargs)
+    if streaming:
+        return AIMessageChunk(
+            content=cast(Union[str, List[Union[str, Dict[Any, Any]]]], content),
+            additional_kwargs=additional_kwargs,
+            tool_call_chunks=tool_call_chunks,
+        )
+
+    return AIMessage(
+        content=cast(Union[str, List[Union[str, Dict[Any, Any]]]], content),
+        tool_calls=tool_calls,
+        additional_kwargs=additional_kwargs,
+        invalid_tool_calls=invalid_tool_calls,
+    )
+
+
+def _completion_with_retry(
+    generation_method: Callable,
+    *,
+    max_retries: int,
+    run_manager: Optional[CallbackManagerForLLMRun] = None,
+    **kwargs: Any,
+) -> Any:
+    """Use tenacity to retry the completion call."""
+    retry_decorator = create_retry_decorator(
+        max_retries=max_retries, run_manager=run_manager
+    )
+
+    @retry_decorator
+    def _completion_with_retry_inner(generation_method: Callable, **kwargs: Any) -> Any:
+        return generation_method(**kwargs)
+
+    params = (
+        {k: v for k, v in kwargs.items() if k in _allowed_params_prediction_service}
+        if kwargs.get("is_gemini")
+        else kwargs
+    )
+    return _completion_with_retry_inner(
+        generation_method,
+        **params,
+    )
+
+
+async def _acompletion_with_retry(
+    generation_method: Callable,
+    *,
+    max_retries: int,
+    run_manager: Optional[CallbackManagerForLLMRun] = None,
+    **kwargs: Any,
+) -> Any:
+    """Use tenacity to retry the completion call."""
+    retry_decorator = create_retry_decorator(
+        max_retries=max_retries, run_manager=run_manager
+    )
+
+    @retry_decorator
+    async def _completion_with_retry_inner(
+        generation_method: Callable, **kwargs: Any
+    ) -> Any:
+        return await generation_method(**kwargs)
+
+    params = (
+        {k: v for k, v in kwargs.items() if k in _allowed_params_prediction_service}
+        if kwargs.get("is_gemini")
+        else kwargs
+    )
+    return await _completion_with_retry_inner(
+        generation_method,
+        **params,
+    )
 
 
 class ChatVertexAI(_VertexAICommon, BaseChatModel):
     """`Vertex AI` Chat large language models API."""
 
-    model_name: str = "chat-bison"
+    model_name: str = Field(default="chat-bison", alias="model")
     "Underlying model name."
     examples: Optional[List[BaseMessage]] = None
-    tuned_model_name: Optional[str] = None
-    """The name of a tuned model. If tuned_model_name is passed
-    model_name will be used to determine the model family
-    """
     convert_system_message_to_human: bool = False
     """[Deprecated] Since new Gemini models support setting a System Message,
     setting this parameter to True is discouraged.
     """
+
+    def __init__(self, *, model_name: Optional[str] = None, **kwargs: Any) -> None:
+        """Needed for mypy typing to recognize model_name as a valid arg."""
+        if model_name:
+            kwargs["model_name"] = model_name
+        super().__init__(**kwargs)
+
+    class Config:
+        """Configuration for this pydantic object."""
+
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
 
     @classmethod
     def is_lc_serializable(cls) -> bool:
@@ -407,31 +594,42 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     @root_validator()
     def validate_environment(cls, values: Dict) -> Dict:
         """Validate that the python package exists in environment."""
-        is_gemini = is_gemini_model(values["model_name"])
-        safety_settings = values["safety_settings"]
+        safety_settings = values.get("safety_settings")
         tuned_model_name = values.get("tuned_model_name")
+        values["model_family"] = GoogleModelFamily(values["model_name"])
 
-        if safety_settings and not is_gemini:
+        if values.get("full_model_name") is not None:
+            pass
+        elif values.get("tuned_model_name") is not None:
+            values["full_model_name"] = _format_model_name(
+                values["tuned_model_name"],
+                location=values["location"],
+                project=values["project"],
+            )
+        else:
+            values["full_model_name"] = _format_model_name(
+                values["model_name"],
+                location=values["location"],
+                project=values["project"],
+            )
+
+        if safety_settings and values["model_family"] not in [
+            GoogleModelFamily.GEMINI,
+            GoogleModelFamily.GEMINI_ADVANCED,
+        ]:
             raise ValueError("Safety settings are only supported for Gemini models")
-
-        cls._init_vertexai(values)
 
         if tuned_model_name:
             generative_model_name = values["tuned_model_name"]
         else:
             generative_model_name = values["model_name"]
 
-        if is_gemini:
-            values["client"] = GenerativeModel(
-                model_name=generative_model_name,
-                safety_settings=safety_settings,
-            )
-            values["client_preview"] = GenerativeModel(
-                model_name=generative_model_name,
-                safety_settings=safety_settings,
-            )
-        else:
-            if is_codey_model(values["model_name"]):
+        if values["model_family"] not in [
+            GoogleModelFamily.GEMINI,
+            GoogleModelFamily.GEMINI_ADVANCED,
+        ]:
+            cls._init_vertexai(values)
+            if values["model_family"] == GoogleModelFamily.CODEY:
                 model_cls = CodeChatModel
                 model_cls_preview = PreviewCodeChatModel
             else:
@@ -445,14 +643,24 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
     @property
     def _is_gemini_advanced(self) -> bool:
-        try:
-            if float(self.model_name.split("-")[1]) > 1.0:
-                return True
-        except ValueError:
-            pass
-        except IndexError:
-            pass
-        return False
+        return self.model_family == GoogleModelFamily.GEMINI_ADVANCED
+
+    def _get_ls_params(
+        self, stop: Optional[List[str]] = None, **kwargs: Any
+    ) -> LangSmithParams:
+        """Get standard params for tracing."""
+        params = self._prepare_params(stop=stop, **kwargs)
+        ls_params = LangSmithParams(
+            ls_provider="google_vertexai",
+            ls_model_name=self.model_name,
+            ls_model_type="chat",
+            ls_temperature=params.get("temperature", self.temperature),
+        )
+        if ls_max_tokens := params.get("max_output_tokens", self.max_output_tokens):
+            ls_params["ls_max_tokens"] = ls_max_tokens
+        if ls_stop := stop or params.get("stop", None) or self.stop:
+            ls_params["ls_stop"] = ls_stop
+        return ls_params
 
     def _generate(
         self,
@@ -477,80 +685,203 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         Raises:
             ValueError: if the last message in the list is not from human.
         """
-        should_stream = stream if stream is not None else self.streaming
-        if should_stream:
-            with tool_context_manager(self._user_agent):
-                stream_iter = self._stream(
-                    messages, stop=stop, run_manager=run_manager, **kwargs
+        if stream is True or (stream is None and self.streaming):
+            stream_iter = self._stream(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+            return generate_from_stream(stream_iter)
+        if not self._is_gemini_model:
+            return self._generate_non_gemini(messages, stop=stop, **kwargs)
+        return self._generate_gemini(
+            messages=messages,
+            stop=stop,
+            run_manager=run_manager,
+            is_gemini=True,
+            **kwargs,
+        )
+
+    def _generation_config_gemini(
+        self,
+        stop: Optional[List[str]] = None,
+        stream: bool = False,
+        **kwargs,
+    ) -> GenerationConfig:
+        """Prepares GenerationConfig part of the request.
+
+        https://cloud.google.com/vertex-ai/docs/reference/rpc/google.cloud.aiplatform.v1beta1#generationconfig
+        """
+        return GenerationConfig(
+            **self._prepare_params(
+                stop=stop,
+                stream=stream,
+                **{k: v for k, v in kwargs.items() if k in _allowed_params},
+            )
+        )
+
+    def _safety_settings_gemini(
+        self, safety_settings: Optional[SafetySettingsType]
+    ) -> Optional[Sequence[SafetySetting]]:
+        """Prepares SafetySetting part of the request.
+
+        https://cloud.google.com/vertex-ai/docs/reference/rpc/google.cloud.aiplatform.v1beta1#safetysetting
+        """
+        if safety_settings is None:
+            if self.safety_settings:
+                return self._safety_settings_gemini(self.safety_settings)
+            return None
+        if isinstance(safety_settings, list):
+            return safety_settings
+        if isinstance(safety_settings, dict):
+            formatted_safety_settings = []
+            for category, threshold in safety_settings.items():
+                if isinstance(category, str):
+                    category = HarmCategory[category]  # type: ignore[misc]
+                if isinstance(threshold, str):
+                    threshold = SafetySetting.HarmBlockThreshold[threshold]  # type: ignore[misc]
+
+                formatted_safety_settings.append(
+                    SafetySetting(
+                        category=HarmCategory(category),
+                        threshold=SafetySetting.HarmBlockThreshold(threshold),
+                    )
                 )
-                return generate_from_stream(stream_iter)
-        safety_settings = kwargs.pop("safety_settings", None)
+            return formatted_safety_settings
+        raise ValueError("safety_settings should be either")
+
+    def _prepare_request_gemini(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        stream: bool = False,
+        tools: Optional[_ToolsType] = None,
+        functions: Optional[_ToolsType] = None,
+        tool_config: Optional[Union[_ToolConfigDict, ToolConfig]] = None,
+        safety_settings: Optional[SafetySettingsType] = None,
+        **kwargs,
+    ) -> GenerateContentRequest:
+        system_instruction, contents = _parse_chat_history_gemini(messages)
+        formatted_tools = self._tools_gemini(tools=tools, functions=functions)
+        tool_config = self._tool_config_gemini(tool_config=tool_config)
+        return GenerateContentRequest(
+            contents=contents,
+            system_instruction=system_instruction,
+            tools=formatted_tools,
+            tool_config=tool_config,
+            safety_settings=self._safety_settings_gemini(safety_settings),
+            generation_config=self._generation_config_gemini(
+                stream=stream, stop=stop, **kwargs
+            ),
+            model=self.full_model_name,
+        )
+
+    def _generate_gemini(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        request = self._prepare_request_gemini(messages=messages, stop=stop, **kwargs)
+        response = _completion_with_retry(
+            self.prediction_client.generate_content,
+            max_retries=self.max_retries,
+            request=request,
+            **kwargs,
+        )
+        return self._gemini_response_to_chat_result(response)
+
+    async def _agenerate_gemini(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        response = await _acompletion_with_retry(
+            self.async_prediction_client.generate_content,
+            max_retries=self.max_retries,
+            request=self._prepare_request_gemini(
+                messages=messages, stop=stop, **kwargs
+            ),
+            is_gemini=True,
+            **kwargs,
+        )
+        return self._gemini_response_to_chat_result(response)
+
+    def get_num_tokens(self, text: str) -> int:
+        """Get the number of tokens present in the text."""
+        if self._is_gemini_model:
+            # https://cloud.google.com/vertex-ai/docs/reference/rpc/google.cloud.aiplatform.v1beta1#counttokensrequest
+            _, contents = _parse_chat_history_gemini([HumanMessage(content=text)])
+            response = self.prediction_client.count_tokens(
+                {
+                    "endpoint": self.full_model_name,
+                    "model": self.full_model_name,
+                    "contents": contents,
+                }
+            )
+            return response.total_tokens
+        else:
+            return super().get_num_tokens(text=text)
+
+    def _tools_gemini(
+        self,
+        tools: Optional[_ToolsType] = None,
+        functions: Optional[_ToolsType] = None,
+    ) -> Optional[Sequence[GapicTool]]:
+        if tools and functions:
+            logger.warning(
+                "Binding tools and functions together is not supported.",
+                "Only tools will be used",
+            )
+        if tools:
+            return [_format_to_gapic_tool(tools)]
+        if functions:
+            return [_format_to_gapic_tool(functions)]
+        return None
+
+    def _tool_config_gemini(
+        self, tool_config: Optional[Union[_ToolConfigDict, ToolConfig]] = None
+    ) -> Optional[GapicToolConfig]:
+        if tool_config and not isinstance(tool_config, ToolConfig):
+            return _format_tool_config(cast(_ToolConfigDict, tool_config))
+        return None
+
+    def _generate_non_gemini(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        kwargs.pop("safety_settings", None)
         params = self._prepare_params(stop=stop, stream=False, **kwargs)
+        question = _get_question(messages)
+        history = _parse_chat_history(messages[:-1])
+        examples = kwargs.get("examples") or self.examples
         msg_params = {}
         if "candidate_count" in params:
             msg_params["candidate_count"] = params.pop("candidate_count")
-
-        if self._is_gemini_model:
-            system_instruction, history_gemini = _parse_chat_history_gemini(
-                messages,
-                project=self.project,
-                convert_system_message_to_human=self.convert_system_message_to_human,
+        if examples:
+            params["examples"] = _parse_examples(examples)
+        with telemetry.tool_context_manager(self._user_agent):
+            chat = self._start_chat(history, **params)
+            response = _completion_with_retry(
+                chat.send_message,
+                max_retries=self.max_retries,
+                message=question.content,
+                **msg_params,
             )
-            self.client = _get_client_with_sys_instruction(
-                client=self.client,
-                system_instruction=system_instruction,
-                model_name=self.model_name,
+        generations = [
+            ChatGeneration(
+                message=AIMessage(content=candidate.text),
+                generation_info=get_generation_info(
+                    candidate,
+                    self._is_gemini_model,
+                    usage_metadata=response.raw_prediction_response.metadata,
+                ),
             )
-
-            # set param to `functions` until core tool/function calling implemented
-            raw_tools = params.pop("functions") if "functions" in params else None
-            tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
-            raw_tool_config = (
-                params.pop("tool_config") if "tool_config" in params else None
-            )
-            tool_config = (
-                _format_tool_config(raw_tool_config) if raw_tool_config else None
-            )
-            with tool_context_manager(self._user_agent):
-                response = self.client.generate_content(
-                    history_gemini,
-                    generation_config=params,
-                    tools=tools,
-                    tool_config=tool_config,
-                    safety_settings=safety_settings,
-                )
-            generations = [
-                ChatGeneration(
-                    message=_parse_response_candidate(candidate),
-                    generation_info=get_generation_info(
-                        candidate,
-                        self._is_gemini_model,
-                        usage_metadata=response.to_dict().get("usage_metadata"),
-                    ),
-                )
-                for candidate in response.candidates
-            ]
-        else:
-            question = _get_question(messages)
-            history = _parse_chat_history(messages[:-1])
-            examples = kwargs.get("examples") or self.examples
-            if examples:
-                params["examples"] = _parse_examples(examples)
-            with tool_context_manager(self._user_agent):
-                chat = self._start_chat(history, **params)
-                response = chat.send_message(str(question.content), **msg_params)
-                print(json.dumps(response, indent=4, ensure_ascii=False)) # DEBUG
-            generations = [
-                ChatGeneration(
-                    message=AIMessage(content=candidate.text),
-                    generation_info=get_generation_info(
-                        candidate,
-                        self._is_gemini_model,
-                        usage_metadata=response.raw_prediction_response.metadata,
-                    ),
-                )
-                for candidate in response.candidates
-            ]
+            for candidate in response.candidates
+        ]
         return ChatResult(generations=generations)
 
     async def _agenerate(
@@ -578,73 +909,51 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             kwargs.pop("stream")
             logger.warning("ChatVertexAI does not currently support async streaming.")
 
-        params = self._prepare_params(stop=stop, **kwargs)
-        safety_settings = kwargs.pop("safety_settings", None)
+        if not self._is_gemini_model:
+            return await self._agenerate_non_gemini(messages, stop=stop, **kwargs)
+
+        return await self._agenerate_gemini(
+            messages=messages,
+            stop=stop,
+            run_manager=run_manager,
+            **kwargs,
+        )
+
+    async def _agenerate_non_gemini(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        kwargs.pop("safety_settings", None)
+        params = self._prepare_params(stop=stop, stream=False, **kwargs)
+        question = _get_question(messages)
+        history = _parse_chat_history(messages[:-1])
+        examples = kwargs.get("examples") or self.examples
         msg_params = {}
         if "candidate_count" in params:
             msg_params["candidate_count"] = params.pop("candidate_count")
-
-        if self._is_gemini_model:
-            system_instruction, history_gemini = _parse_chat_history_gemini(
-                messages,
-                project=self.project,
-                convert_system_message_to_human=self.convert_system_message_to_human,
+        if examples:
+            params["examples"] = _parse_examples(examples)
+        with telemetry.tool_context_manager(self._user_agent):
+            chat = self._start_chat(history, **params)
+            response = await _acompletion_with_retry(
+                chat.send_message_async,
+                message=question.content,
+                max_retries=self.max_retries,
+                **msg_params,
             )
-
-            self.client = _get_client_with_sys_instruction(
-                client=self.client,
-                system_instruction=system_instruction,
-                model_name=self.model_name,
+        generations = [
+            ChatGeneration(
+                message=AIMessage(content=candidate.text),
+                generation_info=get_generation_info(
+                    candidate,
+                    self._is_gemini_model,
+                    usage_metadata=response.raw_prediction_response.metadata,
+                ),
             )
-            # set param to `functions` until core tool/function calling implemented
-            raw_tools = params.pop("functions") if "functions" in params else None
-            tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
-            raw_tool_config = (
-                params.pop("tool_config") if "tool_config" in params else None
-            )
-            tool_config = (
-                _format_tool_config(raw_tool_config) if raw_tool_config else None
-            )
-            with tool_context_manager(self._user_agent):
-                response = await self.client.generate_content_async(
-                    history_gemini,
-                    generation_config=params,
-                    tools=tools,
-                    tool_config=tool_config,
-                    safety_settings=safety_settings,
-                )
-            generations = [
-                ChatGeneration(
-                    message=_parse_response_candidate(c),
-                    generation_info=get_generation_info(
-                        c,
-                        self._is_gemini_model,
-                        usage_metadata=response.to_dict().get("usage_metadata"),
-                    ),
-                )
-                for c in response.candidates
-            ]
-        else:
-            question = _get_question(messages)
-            history = _parse_chat_history(messages[:-1])
-            examples = kwargs.get("examples", None) or self.examples
-            if examples:
-                params["examples"] = _parse_examples(examples)
-            with tool_context_manager(self._user_agent):
-                chat = self._start_chat(history, **params, response_validation=False)
-                response = await chat.send_message_async(str(question.content), **msg_params)
-                print(json.dumps(response, indent=4, ensure_ascii=False)) # DEBUG
-            generations = [
-                ChatGeneration(
-                    message=AIMessage(content=r.text),
-                    generation_info=get_generation_info(
-                        r,
-                        self._is_gemini_model,
-                        usage_metadata=response.raw_prediction_response.metadata,
-                    ),
-                )
-                for r in response.candidates
-            ]
+            for candidate in response.candidates
+        ]
         return ChatResult(generations=generations)
 
     def _stream(
@@ -654,81 +963,64 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
+        if not self._is_gemini_model:
+            yield from self._stream_non_gemini(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+            return
+        yield from self._stream_gemini(
+            messages=messages, stop=stop, run_manager=run_manager, **kwargs
+        )
+        return
+
+    def _stream_gemini(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        request = self._prepare_request_gemini(messages=messages, stop=stop, **kwargs)
+        response_iter = _completion_with_retry(
+            self.prediction_client.stream_generate_content,
+            max_retries=self.max_retries,
+            request=request,
+            is_gemini=True,
+            **kwargs,
+        )
+        for response_chunk in response_iter:
+            chunk = self._gemini_chunk_to_generation_chunk(response_chunk)
+            if run_manager and isinstance(chunk.message.content, str):
+                run_manager.on_llm_new_token(chunk.message.content)
+            yield chunk
+
+    def _stream_non_gemini(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
         params = self._prepare_params(stop=stop, stream=True, **kwargs)
-        if self._is_gemini_model:
-            safety_settings = params.pop("safety_settings", None)
-            system_instruction, history_gemini = _parse_chat_history_gemini(
-                messages,
-                project=self.project,
-                convert_system_message_to_human=self.convert_system_message_to_human,
-            )
-            self.client = _get_client_with_sys_instruction(
-                client=self.client,
-                system_instruction=system_instruction,
-                model_name=self.model_name,
-            )
-            # set param to `functions` until core tool/function calling implemented
-            raw_tools = params.pop("functions") if "functions" in params else None
-            tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
-            raw_tool_config = (
-                params.pop("tool_config") if "tool_config" in params else None
-            )
-            tool_config = (
-                _format_tool_config(raw_tool_config) if raw_tool_config else None
-            )
-            with tool_context_manager(self._user_agent):
-                responses = self.client.generate_content(
-                    history_gemini,
-                    stream=True,
-                    generation_config=params,
-                    tools=tools,
-                    tool_config=tool_config,
-                    safety_settings=safety_settings,
-                )
-                for response in responses:
-                    message = _parse_response_candidate(
-                        response.candidates[0], streaming=True
-                    )
-                    generation_info = get_generation_info(
-                        response.candidates[0],
+        question = _get_question(messages)
+        history = _parse_chat_history(messages[:-1])
+        examples = kwargs.get("examples", None)
+        if examples:
+            params["examples"] = _parse_examples(examples)
+        with telemetry.tool_context_manager(self._user_agent):
+            chat = self._start_chat(history, **params)
+            responses = chat.send_message_streaming(question.content, **params)
+            for response in responses:
+                if run_manager:
+                    run_manager.on_llm_new_token(response.text)
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(content=response.text),
+                    generation_info=get_generation_info(
+                        response,
                         self._is_gemini_model,
-                        usage_metadata=response.to_dict().get("usage_metadata"),
-                    )
-                    if run_manager and isinstance(message.content, str):
-                        run_manager.on_llm_new_token(message.content)
-                    if isinstance(message, AIMessageChunk):
-                        yield ChatGenerationChunk(
-                            message=message,
-                            generation_info=generation_info,
-                        )
-                    else:
-                        yield ChatGenerationChunk(
-                            message=AIMessageChunk(
-                                content=message.content,
-                                additional_kwargs=message.additional_kwargs,
-                            ),
-                            generation_info=generation_info,
-                        )
-        else:
-            question = _get_question(messages)
-            history = _parse_chat_history(messages[:-1])
-            examples = kwargs.get("examples", None)
-            if examples:
-                params["examples"] = _parse_examples(examples)
-            with tool_context_manager(self._user_agent):
-                chat = self._start_chat(history, **params)
-                responses = chat.send_message_streaming(str(question.content), **params)
-                for response in responses:
-                    if run_manager:
-                        run_manager.on_llm_new_token(response.text)
-                    yield ChatGenerationChunk(
-                        message=AIMessageChunk(content=response.text),
-                        generation_info=get_generation_info(
-                            response,
-                            self._is_gemini_model,
-                            usage_metadata=response.raw_prediction_response.metadata,
-                        ),
-                    )
+                        usage_metadata=response.raw_prediction_response.metadata,
+                    ),
+                )
 
     async def _astream(
         self,
@@ -739,53 +1031,20 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     ) -> AsyncIterator[ChatGenerationChunk]:
         if not self._is_gemini_model:
             raise NotImplementedError()
-        params = self._prepare_params(stop=stop, stream=True, **kwargs)
-        safety_settings = params.pop("safety_settings", None)
-        system_instruction, history_gemini = _parse_chat_history_gemini(
-            messages,
-            project=self.project,
-            convert_system_message_to_human=self.convert_system_message_to_human,
+        request = self._prepare_request_gemini(messages=messages, stop=stop, **kwargs)
+
+        response_iter = _acompletion_with_retry(
+            self.async_prediction_client.stream_generate_content,
+            max_retries=self.max_retries,
+            request=request,
+            is_gemini=True,
+            **kwargs,
         )
-        self.client = _get_client_with_sys_instruction(
-            client=self.client,
-            system_instruction=system_instruction,
-            model_name=self.model_name,
-        )
-        raw_tools = params.pop("functions") if "functions" in params else None
-        tools = _format_tools_to_vertex_tool(raw_tools) if raw_tools else None
-        raw_tool_config = params.pop("tool_config") if "tool_config" in params else None
-        tool_config = _format_tool_config(raw_tool_config) if raw_tool_config else None
-        with tool_context_manager(self._user_agent):
-            async for chunk in await self.client.generate_content_async(
-                history_gemini,
-                stream=True,
-                generation_config=params,
-                tools=tools,
-                tool_config=tool_config,
-                safety_settings=safety_settings,
-            ):
-                print(chunk) # DEBUG
-                message = _parse_response_candidate(chunk.candidates[0], streaming=True)
-                generation_info = get_generation_info(
-                    chunk.candidates[0],
-                    self._is_gemini_model,
-                    usage_metadata=chunk.to_dict().get("usage_metadata"),
-                )
-                if run_manager and isinstance(message.content, str):
-                    await run_manager.on_llm_new_token(message.content)
-                if isinstance(message, AIMessageChunk):
-                    yield ChatGenerationChunk(
-                        message=message,
-                        generation_info=generation_info,
-                    )
-                else:
-                    yield ChatGenerationChunk(
-                        message=AIMessageChunk(
-                            content=message.content,
-                            additional_kwargs=message.additional_kwargs,
-                        ),
-                        generation_info=generation_info,
-                    )
+        async for response_chunk in await response_iter:
+            chunk = self._gemini_chunk_to_generation_chunk(response_chunk)
+            if run_manager and isinstance(chunk.message.content, str):
+                await run_manager.on_llm_new_token(chunk.message.content)
+            yield chunk
 
     def with_structured_output(
         self,
@@ -884,26 +1143,12 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         if kwargs:
             raise ValueError(f"Received unsupported arguments {kwargs}")
         if isinstance(schema, type) and issubclass(schema, BaseModel):
-            parser: OutputParserLike = PydanticOutputFunctionsParser(
-                pydantic_schema=schema
+            parser: OutputParserLike = PydanticToolsParser(
+                tools=[schema], first_tool_only=True
             )
         else:
-            parser = JsonOutputFunctionsParser()
-
-        name = _format_tool_to_vertex_function(schema)["name"]
-
-        if self._is_gemini_advanced:
-            llm = self.bind(
-                functions=[schema],
-                tool_config={
-                    "function_calling_config": {
-                        "mode": ToolConfig.FunctionCallingConfig.Mode.ANY,
-                        "allowed_function_names": [name],
-                    }
-                },
-            )
-        else:
-            llm = self.bind(functions=[schema])
+            parser = JsonOutputToolsParser()
+        llm = self.bind_tools([schema], tool_choice=self._is_gemini_advanced)
         if include_raw:
             parser_with_fallback = RunnablePassthrough.assign(
                 parsed=itemgetter("raw") | parser, parsing_error=lambda _: None
@@ -917,8 +1162,10 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
     def bind_tools(
         self,
-        tools: Sequence[Union[Type[BaseModel], Callable, BaseTool]],
-        tool_config: Optional[Dict[str, Any]] = None,
+        tools: _ToolsType,
+        tool_config: Optional[_ToolConfigDict] = None,
+        *,
+        tool_choice: Optional[Union[_ToolChoiceType, bool]] = None,
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, BaseMessage]:
         """Bind tool-like objects to this chat model.
@@ -933,26 +1180,69 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
             **kwargs: Any additional parameters to pass to the
                 :class:`~langchain.runnable.Runnable` constructor.
         """
-        formatted_tools = []
-        for schema in tools:
-            if isinstance(schema, BaseTool) or (
-                isinstance(schema, type) and issubclass(schema, BaseModel)
-            ):
-                formatted_tools.append(schema)
-            elif callable(schema):
-                formatted_tools.append(tool_from_callable(schema))  # type: ignore
-            else:
-                raise ValueError(
-                    "Tool must be a BaseTool, Pydantic model, or callable."
-                )
-        return self.bind(functions=formatted_tools, tool_config=tool_config, **kwargs)
+        if tool_choice and tool_config:
+            raise ValueError(
+                "Must specify at most one of tool_choice and tool_config, received "
+                f"both:\n\n{tool_choice=}\n\n{tool_config=}"
+            )
+        vertexai_tool = _format_to_gapic_tool(tools)
+        if tool_choice:
+            all_names = [f.name for f in vertexai_tool.function_declarations]
+            tool_config = _tool_choice_to_tool_config(tool_choice, all_names)
+        # Bind dicts for easier serialization/deserialization.
+        return self.bind(tools=[vertexai_tool], tool_config=tool_config, **kwargs)
 
     def _start_chat(
         self, history: _ChatHistory, **kwargs: Any
     ) -> Union[ChatSession, CodeChatSession]:
-        if not self.is_codey_model:
+        if self.model_family == GoogleModelFamily.CODEY:
             return self.client.start_chat(
                 context=history.context, message_history=history.history, **kwargs
             )
         else:
             return self.client.start_chat(message_history=history.history, **kwargs)
+
+    def _gemini_response_to_chat_result(
+        self, response: GenerationResponse
+    ) -> ChatResult:
+        generations = []
+        usage = proto.Message.to_dict(response.usage_metadata)
+        for candidate in response.candidates:
+            info = get_generation_info(candidate, is_gemini=True, usage_metadata=usage)
+            message = _parse_response_candidate(candidate)
+            generations.append(ChatGeneration(message=message, generation_info=info))
+        if not response.candidates:
+            message = AIMessage(content="")
+            if usage:
+                generation_info = {"usage_metadata": usage}
+            else:
+                generation_info = {}
+            generations.append(
+                ChatGeneration(message=message, generation_info=generation_info)
+            )
+        return ChatResult(generations=generations)
+
+    def _gemini_chunk_to_generation_chunk(
+        self, response_chunk: GenerationResponse
+    ) -> ChatGenerationChunk:
+        # return an empty completion message if there's no candidates
+        usage_metadata = proto.Message.to_dict(response_chunk.usage_metadata)
+        if not response_chunk.candidates:
+            message = AIMessageChunk(content="")
+            if usage_metadata:
+                generation_info = {"usage_metadata": usage_metadata}
+            else:
+                generation_info = {}
+        else:
+            top_candidate = response_chunk.candidates[0]
+            message = _parse_response_candidate(top_candidate, streaming=True)
+            generation_info = get_generation_info(
+                top_candidate,
+                is_gemini=True,
+                # TODO: uncomment when merging ints is fixed
+                # usage_metadata=usage_metadata,
+            )
+        return ChatGenerationChunk(
+            message=message,
+            generation_info=generation_info,
+        )

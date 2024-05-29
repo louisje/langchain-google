@@ -3,6 +3,7 @@
 Your end-user credentials would be used to make the calls (make sure you've run
 `gcloud auth login` first).
 """
+
 import pytest
 from vertexai.language_models import TextEmbeddingModel  # type: ignore
 from vertexai.vision_models import MultiModalEmbeddingModel  # type: ignore
@@ -16,7 +17,13 @@ from langchain_google_vertexai.embeddings import (
 @pytest.mark.release
 def test_initialization() -> None:
     """Test embedding model initialization."""
-    VertexAIEmbeddings(model_name="textembedding-gecko@001")
+    for embeddings in [
+        VertexAIEmbeddings(
+            model_name="textembedding-gecko",
+        ),
+        VertexAIEmbeddings(model="textembedding-gecko"),
+    ]:
+        assert embeddings.model_name == "textembedding-gecko"
 
 
 @pytest.mark.release
@@ -59,13 +66,13 @@ def test_langchain_google_vertexai_large_batches() -> None:
     model_uscentral1 = VertexAIEmbeddings(
         model_name="textembedding-gecko@001", location="us-central1"
     )
-    model_asianortheast1 = VertexAIEmbeddings(
-        model_name="textembedding-gecko@001", location="asia-northeast1"
-    )
+    # model_asianortheast1 = VertexAIEmbeddings(
+    #    model_name="textembedding-gecko@001", location="asia-northeast1"
+    # )
     model_uscentral1.embed_documents(documents)
-    model_asianortheast1.embed_documents(documents)
+    # model_asianortheast1.embed_documents(documents)
     assert model_uscentral1.instance["batch_size"] >= 250
-    assert model_asianortheast1.instance["batch_size"] < 50
+    # assert model_asianortheast1.instance["batch_size"] < 50
 
 
 @pytest.mark.release

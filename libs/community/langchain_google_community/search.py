@@ -1,4 +1,5 @@
 """Util that calls Google Search."""
+
 from typing import Any, Dict, List, Optional
 from langchain_community.document_loaders.chromium import AsyncChromiumLoader
 from langchain_community.document_transformers.html2text import Html2TextTransformer
@@ -86,8 +87,7 @@ class GoogleSearchAPIWrapper(BaseModel):
         except ImportError:
             raise ImportError(
                 "google-api-python-client is not installed. "
-                "Please install it with `pip install google-api-python-client"
-                ">=2.100.0`"
+                "Please install it with `pip install langchain-google-community`"
             )
 
         service = build("customsearch", "v1", developerKey=google_api_key)

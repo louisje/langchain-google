@@ -2,6 +2,7 @@
 
 import dataclasses
 import re
+from enum import Enum, auto
 from importlib import metadata
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -69,13 +70,13 @@ def get_user_agent(module: Optional[str] = None) -> Tuple[str, str]:
         Tuple[str, str]
     """
     try:
-        langchain_version = metadata.version("langchain")
+        langchain_version = metadata.version("langchain-google-vertexai")
     except metadata.PackageNotFoundError:
         langchain_version = "0.0.0"
     client_library_version = (
         f"{langchain_version}-{module}" if module else langchain_version
     )
-    return client_library_version, f"langchain/{client_library_version}"
+    return client_library_version, f"langchain-google-vertexai/{client_library_version}"
 
 
 def get_client_info(module: Optional[str] = None) -> "ClientInfo":
@@ -94,6 +95,16 @@ def get_client_info(module: Optional[str] = None) -> "ClientInfo":
     )
 
 
+def _format_model_name(model: str, project: str, location: str) -> str:
+    if "/" not in model:
+        model = "publishers/google/models/" + model
+    if model.startswith("models/"):
+        model = "publishers/google/" + model
+    if model.startswith("publishers/"):
+        return f"projects/{project}/locations/{location}/{model}"
+    return model
+
+
 def load_image_from_gcs(path: str, project: Optional[str] = None) -> Image:
     """Loads an Image from GCS."""
     gcs_client = storage.Client(project=project)
@@ -104,14 +115,33 @@ def load_image_from_gcs(path: str, project: Optional[str] = None) -> Image:
     return Image.from_bytes(blobs[0].download_as_bytes())
 
 
-def is_codey_model(model_name: str) -> bool:
-    """Returns True if the model name is a Codey model."""
-    return "code" in model_name
+class GoogleModelFamily(str, Enum):
+    GEMINI = auto()
+    GEMINI_ADVANCED = auto()
+    CODEY = auto()
+    PALM = auto()
+
+    @classmethod
+    def _missing_(cls, value: Any) -> "GoogleModelFamily":
+        # https://cloud.google.com/vertex-ai/generative-ai/docs/learn/model-versioning
+        if value.lower() in [
+            "gemini-1.5-flash-preview-0514",
+            "gemini-1.5-pro-preview-0514",
+            "gemini-1.5-pro-preview-0409",
+        ]:
+            return GoogleModelFamily.GEMINI_ADVANCED
+        if "gemini" in value.lower():
+            return GoogleModelFamily.GEMINI
+        if "code" in value.lower():
+            return GoogleModelFamily.CODEY
+        elif "bison" in value.lower():
+            return GoogleModelFamily.PALM
+        return GoogleModelFamily.GEMINI
 
 
-def is_gemini_model(model_name: str) -> bool:
+def is_gemini_model(model_family: GoogleModelFamily) -> bool:
     """Returns True if the model name is a Gemini model."""
-    return model_name is not None and "gemini" in model_name
+    return model_family in [GoogleModelFamily.GEMINI, GoogleModelFamily.GEMINI_ADVANCED]
 
 
 def get_generation_info(
@@ -138,9 +168,16 @@ def get_generation_info(
                 if candidate.citation_metadata
                 else None
             ),
+            "usage_metadata": usage_metadata,
         }
-        if usage_metadata:
-            info["usage_metadata"] = usage_metadata
+        try:
+            if candidate.grounding_metadata:
+                info["grounding_metadata"] = proto.Message.to_dict(
+                    candidate.grounding_metadata
+                )
+        except AttributeError:
+            pass
+        info = {k: v for k, v in info.items() if v is not None}
     # https://cloud.google.com/vertex-ai/docs/generative-ai/model-reference/text-chat#response_body
     else:
         info = dataclasses.asdict(candidate)

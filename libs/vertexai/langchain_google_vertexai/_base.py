@@ -5,30 +5,40 @@ from typing import Any, ClassVar, Dict, List, Optional
 
 import vertexai  # type: ignore[import-untyped]
 from google.api_core.client_options import ClientOptions
+from google.cloud.aiplatform import initializer
+from google.cloud.aiplatform.constants import base as constants
 from google.cloud.aiplatform.gapic import (
     PredictionServiceAsyncClient,
     PredictionServiceClient,
 )
 from google.cloud.aiplatform.models import Prediction
+from google.cloud.aiplatform_v1beta1.services.prediction_service import (
+    PredictionServiceAsyncClient as v1beta1PredictionServiceAsyncClient,
+)
+from google.cloud.aiplatform_v1beta1.services.prediction_service import (
+    PredictionServiceClient as v1beta1PredictionServiceClient,
+)
 from google.protobuf import json_format
 from google.protobuf.struct_pb2 import Value
 from langchain_core.outputs import Generation, LLMResult
 from langchain_core.pydantic_v1 import BaseModel, Field, root_validator
+from vertexai.generative_models._generative_models import (  # type: ignore
+    SafetySettingsType,
+)
 from vertexai.language_models import (  # type: ignore[import-untyped]
     TextGenerationModel,
 )
-from vertexai.preview.language_models import (  # type: ignore[import-untyped]
+from vertexai.preview.language_models import (  # type: ignore
     ChatModel as PreviewChatModel,
 )
 from vertexai.preview.language_models import (
     CodeChatModel as PreviewCodeChatModel,
 )
 
-from langchain_google_vertexai._enums import HarmBlockThreshold, HarmCategory
 from langchain_google_vertexai._utils import (
+    GoogleModelFamily,
     get_client_info,
     get_user_agent,
-    is_codey_model,
     is_gemini_model,
 )
 
@@ -36,13 +46,15 @@ _PALM_DEFAULT_MAX_OUTPUT_TOKENS = TextGenerationModel._DEFAULT_MAX_OUTPUT_TOKENS
 _PALM_DEFAULT_TEMPERATURE = 0.0
 _PALM_DEFAULT_TOP_P = 0.95
 _PALM_DEFAULT_TOP_K = 40
+_DEFAULT_LOCATION = "us-central1"
 
 
 class _VertexAIBase(BaseModel):
     client: Any = None  #: :meta private:
+    async_client: Any = None  #: :meta private:
     project: Optional[str] = None
     "The default GCP project to use when making Vertex API calls."
-    location: str = "us-central1"
+    location: str = _DEFAULT_LOCATION
     "The default location to use when making API calls."
     request_parallelism: int = 5
     "The amount of parallelism allowed for requests issued to VertexAI models. "
@@ -50,25 +62,68 @@ class _VertexAIBase(BaseModel):
     max_retries: int = 6
     """The maximum number of retries to make when generating."""
     task_executor: ClassVar[Optional[Executor]] = Field(default=None, exclude=True)
-    stop: Optional[List[str]] = None
+    stop: Optional[List[str]] = Field(default=None, alias="stop_sequences")
     "Optional list of stop words to use when generating."
-    model_name: Optional[str] = None
+    model_name: Optional[str] = Field(default=None, alias="model")
     "Underlying model name."
+    model_family: Optional[GoogleModelFamily] = None
+    full_model_name: Optional[str] = None
+    """The full name of the model's endpoint."""
+
+    class Config:
+        """Configuration for this pydantic object."""
+
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
 
     @root_validator(pre=True)
-    def validate_params(cls, values: dict) -> dict:
+    def validate_params_base(cls, values: dict) -> dict:
         if "model" in values and "model_name" not in values:
             values["model_name"] = values.pop("model")
+        if values.get("project") is None:
+            values["project"] = initializer.global_config.project
         return values
+
+    @property
+    def prediction_client(self) -> v1beta1PredictionServiceClient:
+        """Returns PredictionServiceClient."""
+        if self.client is None:
+            client_options = {
+                "api_endpoint": f"{self.location}-{constants.PREDICTION_API_BASE_PATH}"
+            }
+            self.client = v1beta1PredictionServiceClient(
+                client_options=client_options,
+                client_info=get_client_info(module=self._user_agent),
+            )
+        return self.client
+
+    @property
+    def async_prediction_client(self) -> v1beta1PredictionServiceAsyncClient:
+        """Returns PredictionServiceClient."""
+        if self.async_client is None:
+            client_options = {
+                "api_endpoint": f"{self.location}-{constants.PREDICTION_API_BASE_PATH}"
+            }
+            self.async_client = v1beta1PredictionServiceAsyncClient(
+                client_options=ClientOptions(**client_options),
+                client_info=get_client_info(module=self._user_agent),
+            )
+        return self.async_client
+
+    @property
+    def _user_agent(self) -> str:
+        """Gets the User Agent."""
+        _, user_agent = get_user_agent(f"{type(self).__name__}_{self.model_name}")
+        return user_agent
 
 
 class _VertexAICommon(_VertexAIBase):
     client_preview: Any = None  #: :meta private:
-    model_name: str
+    model_name: str = Field(default=None, alias="model")
     "Underlying model name."
     temperature: Optional[float] = None
     "Sampling temperature, it controls the degree of randomness in token selection."
-    max_output_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = Field(default=None, alias="max_tokens")
     "Token limit determines the maximum amount of text output from one prompt."
     top_p: Optional[float] = None
     "Tokens are selected from most probable to least until the sum of their "
@@ -84,7 +139,7 @@ class _VertexAICommon(_VertexAIBase):
     """How many completions to generate for each prompt."""
     streaming: bool = False
     """Whether to stream the results or not."""
-    safety_settings: Optional[Dict[HarmCategory, HarmBlockThreshold]] = None
+    safety_settings: Optional["SafetySettingsType"] = None
     """The default safety settings to use for all generations. 
     
         For example: 
@@ -100,17 +155,22 @@ class _VertexAICommon(_VertexAIBase):
             }
             """  # noqa: E501
 
-    @property
-    def _llm_type(self) -> str:
-        return "vertexai"
-
-    @property
-    def is_codey_model(self) -> bool:
-        return is_codey_model(self.model_name)
+    api_transport: Optional[str] = None
+    """The desired API transport method, can be either 'grpc' or 'rest'"""
+    api_endpoint: Optional[str] = None
+    """The desired API endpoint, e.g., us-central1-aiplatform.googleapis.com"""
+    tuned_model_name: Optional[str] = None
+    """The name of a tuned model. If tuned_model_name is passed
+    model_name will be used to determine the model family
+    """
 
     @property
     def _is_gemini_model(self) -> bool:
-        return is_gemini_model(self.model_name)
+        return is_gemini_model(self.model_family)  # type: ignore[arg-type]
+
+    @property
+    def _llm_type(self) -> str:
+        return "vertexai"
 
     @property
     def _identifying_params(self) -> Dict[str, Any]:
@@ -119,7 +179,7 @@ class _VertexAICommon(_VertexAIBase):
 
     @property
     def _default_params(self) -> Dict[str, Any]:
-        if self._is_gemini_model:
+        if self.model_family == GoogleModelFamily.GEMINI:
             default_params = {}
         else:
             default_params = {
@@ -133,7 +193,7 @@ class _VertexAICommon(_VertexAIBase):
             "max_output_tokens": self.max_output_tokens,
             "candidate_count": self.n,
         }
-        if not self.is_codey_model:
+        if not self.model_family == GoogleModelFamily.CODEY:
             params.update(
                 {
                     "top_k": self.top_k,
@@ -149,18 +209,14 @@ class _VertexAICommon(_VertexAIBase):
                 )
         return updated_params
 
-    @property
-    def _user_agent(self) -> str:
-        """Gets the User Agent."""
-        _, user_agent = get_user_agent(f"{type(self).__name__}_{self.model_name}")
-        return user_agent
-
     @classmethod
     def _init_vertexai(cls, values: Dict) -> None:
         vertexai.init(
             project=values.get("project"),
             location=values.get("location"),
             credentials=values.get("credentials"),
+            api_transport=values.get("api_transport"),
+            api_endpoint=values.get("api_endpoint"),
         )
         return None
 
@@ -196,7 +252,6 @@ class _VertexAICommon(_VertexAIBase):
             result = self.client_preview.start_chat().count_tokens(text)
         else:
             result = self.client_preview.count_tokens([text])
-
         return result.total_tokens
 
 

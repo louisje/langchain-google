@@ -1,7 +1,6 @@
 [tool.poetry]
 name = "langchain-google-vertexai"
-
-version = "1.0.1"
+version = "1.0.4"
 description = "An integration package connecting Google VertexAI and LangChain"
 authors = []
 readme = "README.md"
@@ -16,10 +15,8 @@ python = ">=3.8.1,<4.0"
 langchain-core = {path = "../../../langchain/libs/core", develop = true}
 google-cloud-aiplatform = "^1.47.0"
 google-cloud-storage = "^2.14.0"
-types-requests = "^2.31.0"
-types-protobuf = "^4.24.0.4"
 # optional dependencies
-anthropic = {extras = ["vertexai"], version = ">=0.23.0,<1", optional = true}
+anthropic = { extras = ["vertexai"], version = ">=0.23.0,<1", optional = true }
 
 [tool.poetry.group.test]
 optional = true
@@ -31,11 +28,16 @@ pytest-mock = "^3.10.0"
 syrupy = "^4.0.2"
 pytest-watcher = "^0.3.4"
 pytest-asyncio = "^0.21.1"
-langchain = "^0.1.6"
+langchain = { git = "https://github.com/langchain-ai/langchain.git", subdirectory = "libs/langchain" }
+langchain-text-splitters = { git = "https://github.com/langchain-ai/langchain.git", subdirectory = "libs/text-splitters" }
 types-requests = "^2.31.0.20231231"
 types-protobuf = "^4.24.0.4"
 numexpr = "^2.8.6"
 google-api-python-client = "^2.117.0"
+langchain-core = {path = "../../../langchain/libs/core", develop = true}
+
+[tool.codespell]
+ignore-words-list = "rouge"
 
 [tool.poetry.group.codespell]
 optional = true
@@ -56,6 +58,17 @@ optional = true
 
 [tool.poetry.group.lint.dependencies]
 ruff = "^0.1.5"
+
+[tool.poetry.group.typing.dependencies]
+mypy = "^1"
+types-google-cloud-ndb = "^2.2.0.20240106"
+types-protobuf = "^4.24.0.4"
+types-requests = "^2.31.0"
+langchain-core = {path = "../../../langchain/libs/core", develop = true}
+
+
+[tool.poetry.group.dev.dependencies]
+langchain-core = {path = "../../../langchain/libs/core", develop = true}
 
 [tool.poetry.extras]
 anthropic = ["anthropic"]
@@ -96,7 +109,7 @@ build-backend = "poetry.core.masonry.api"
 #
 # https://github.com/tophat/syrupy
 # --snapshot-warn-unused    Prints a warning on unused snapshots rather than fail the test suite.
-addopts = "--snapshot-warn-unused --strict-markers --strict-config --durations=5"
+addopts = "--strict-markers --strict-config --durations=5"
 # Registering custom markers.
 # https://docs.pytest.org/en/7.1.x/example/markers.html#registering-markers
 markers = [
