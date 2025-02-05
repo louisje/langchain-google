@@ -46,6 +46,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.messages.ai import UsageMetadata
 from langchain_core.output_parsers.base import OutputParserLike
 from langchain_core.output_parsers.openai_tools import (
     JsonOutputToolsParser,
@@ -871,13 +872,15 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 message=question.content,
                 **msg_params,
             )
+        usage_metadata = response.raw_prediction_response.metadata
+        lc_usage = _get_usage_metadata_non_gemini(usage_metadata)
         generations = [
             ChatGeneration(
-                message=AIMessage(content=candidate.text),
+                message=AIMessage(content=candidate.text, usage_metadata=lc_usage),
                 generation_info=get_generation_info(
                     candidate,
                     self._is_gemini_model,
-                    usage_metadata=response.raw_prediction_response.metadata,
+                    usage_metadata=usage_metadata,
                 ),
             )
             for candidate in response.candidates
@@ -943,13 +946,15 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 max_retries=self.max_retries,
                 **msg_params,
             )
+        usage_metadata = response.raw_prediction_response.metadata
+        lc_usage = _get_usage_metadata_non_gemini(usage_metadata)
         generations = [
             ChatGeneration(
-                message=AIMessage(content=candidate.text),
+                message=AIMessage(content=candidate.text, usage_metadata=lc_usage),
                 generation_info=get_generation_info(
                     candidate,
                     self._is_gemini_model,
-                    usage_metadata=response.raw_prediction_response.metadata,
+                    usage_metadata=usage_metadata,
                 ),
             )
             for candidate in response.candidates
@@ -1207,14 +1212,18 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     ) -> ChatResult:
         generations = []
         usage = proto.Message.to_dict(response.usage_metadata)
+        lc_usage = _get_usage_metadata_gemini(usage)
         for candidate in response.candidates:
             info = get_generation_info(candidate, is_gemini=True, usage_metadata=usage)
             message = _parse_response_candidate(candidate)
+            if isinstance(message, AIMessage):
+                message.usage_metadata = lc_usage
             generations.append(ChatGeneration(message=message, generation_info=info))
         if not response.candidates:
             message = AIMessage(content="")
             if usage:
                 generation_info = {"usage_metadata": usage}
+                message.usage_metadata = lc_usage
             else:
                 generation_info = {}
             generations.append(
@@ -1227,8 +1236,13 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     ) -> ChatGenerationChunk:
         # return an empty completion message if there's no candidates
         usage_metadata = proto.Message.to_dict(response_chunk.usage_metadata)
+
+        # Gather langchain (standard) usage metadata
+        lc_usage = _get_usage_metadata_gemini(usage_metadata)
         if not response_chunk.candidates:
             message = AIMessageChunk(content="")
+            if lc_usage:
+                message.usage_metadata = lc_usage
             if usage_metadata:
                 generation_info = {"usage_metadata": usage_metadata}
             else:
@@ -1236,6 +1250,8 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         else:
             top_candidate = response_chunk.candidates[0]
             message = _parse_response_candidate(top_candidate, streaming=True)
+            if lc_usage:
+                message.usage_metadata = lc_usage
             generation_info = get_generation_info(
                 top_candidate,
                 is_gemini=True,
@@ -1245,4 +1261,34 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         return ChatGenerationChunk(
             message=message,
             generation_info=generation_info,
+        )
+
+
+def _get_usage_metadata_gemini(raw_metadata: dict) -> Optional[UsageMetadata]:
+    """Get UsageMetadata from raw response metadata."""
+    input_tokens = raw_metadata.get("prompt_token_count", 0)
+    output_tokens = raw_metadata.get("candidates_token_count", 0)
+    total_tokens = raw_metadata.get("total_token_count", 0)
+    if all(count == 0 for count in [input_tokens, output_tokens, total_tokens]):
+        return None
+    else:
+        return UsageMetadata(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+        )
+
+
+def _get_usage_metadata_non_gemini(raw_metadata: dict) -> Optional[UsageMetadata]:
+    """Get UsageMetadata from raw response metadata."""
+    token_usage = raw_metadata.get("tokenMetadata", {})
+    input_tokens = token_usage.get("inputTokenCount", {}).get("totalTokens", 0)
+    output_tokens = token_usage.get("outputTokenCount", {}).get("totalTokens", 0)
+    if input_tokens == 0 and output_tokens == 0:
+        return None
+    else:
+        return UsageMetadata(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
         )
